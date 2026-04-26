@@ -76,14 +76,14 @@ build_agent_cmd() {
     local agent="$1" prompt_file="$2"
     case "$agent" in
         claude-code)
-            # stdin prompt → interactive TUI with tool access
-            echo "claude --dangerously-skip-permissions < $(printf '%q' "$prompt_file")" ;;
+            # Pipe prompt + /exit so claude processes then quits.
+            # User sees interactive TUI while it works, then it exits cleanly.
+            echo "(cat $(printf '%q' "$prompt_file"); echo; echo '/exit') | claude --dangerously-skip-permissions" ;;
         codex)
             echo "codex \"\$(cat $(printf '%q' "$prompt_file"))\"" ;;
         gemini-cli)
             echo "gemini -p \"\$(cat $(printf '%q' "$prompt_file"))\" -y" ;;
         *)
-            # Unknown agent: try as command with stdin prompt
             echo "$agent < $(printf '%q' "$prompt_file")" ;;
     esac
 }
