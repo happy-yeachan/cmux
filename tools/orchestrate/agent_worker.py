@@ -27,6 +27,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -55,6 +56,7 @@ ROLE_COLORS = {
 SOCKET_PATH = os.environ.get(
     "CMUX_ORCHESTRATE_SOCK", "/tmp/cmux-orchestrate.sock"
 )
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 # Health-check interval (seconds)
 HEALTH_CHECK_INTERVAL = 10
@@ -62,6 +64,27 @@ HEALTH_CHECK_INTERVAL = 10
 SNAPSHOT_INTERVAL = 30
 
 _CURRENT_AGENT: str = ""
+
+
+# ── Agent config from JSON ──────────────���────────────────────────────
+
+def load_agent_config(agent_name: str) -> dict | None:
+    """Load agent execution config from agents.json."""
+    config_paths = [
+        Path(os.environ.get("CMUX_ORCHESTRATE_AGENTS", "")),
+        SCRIPT_DIR / "agents.json",
+        Path.home() / ".config" / "cmux-orchestrate" / "agents.json",
+    ]
+    for p in config_paths:
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text())
+                for agent in data.get("agents", []):
+                    if agent.get("name") == agent_name:
+                        return agent
+            except (json.JSONDecodeError, OSError):
+                continue
+    return None
 
 
 def log(role: str, msg: str, color: str = "") -> None:
@@ -125,16 +148,30 @@ async def run_agent_mock(role: str, task_payload: str) -> str:
 
 
 def _run_interactive(cmd: list[str], cwd: str, capture_file: str,
-                     progress_callback=None) -> tuple[int, str]:
+                     progress_callback=None,
+                     stdin_text: str | None = None) -> tuple[int, str]:
     """Run a command interactively in the real terminal with health-check.
 
     No hard timeout. The agent runs until it exits naturally.
     Health-check monitors capture file activity. Progress snapshots
     are sent periodically via the callback.
 
+    Args:
+        stdin_text: If provided, pipe this text to the process stdin then
+                    close stdin (EOF). Used for agents like claude-code that
+                    read the prompt from stdin and show interactive TUI.
+
     macOS script syntax: script -q <file> <command> [args...]
     """
-    script_cmd = ["script", "-q", capture_file] + cmd
+    if stdin_text:
+        # Wrap command to pipe prompt via stdin: bash -c 'cmd < prompt_file'
+        prompt_file = capture_file + ".prompt"
+        Path(prompt_file).write_text(stdin_text)
+        shell_cmd = " ".join(shlex.quote(c) for c in cmd) + f" < {shlex.quote(prompt_file)}"
+        script_cmd = ["script", "-q", capture_file, "bash", "-c", shell_cmd]
+    else:
+        script_cmd = ["script", "-q", capture_file] + cmd
+
     proc = subprocess.Popen(script_cmd, cwd=cwd)
 
     last_size = 0
@@ -174,6 +211,7 @@ def _run_interactive(cmd: list[str], cwd: str, capture_file: str,
     # Read final output
     output = _read_capture(capture_file)
     Path(capture_file).unlink(missing_ok=True)
+    Path(capture_file + ".prompt").unlink(missing_ok=True)
 
     elapsed = int(time.time() - start_time)
     log("", f"  agent exited (code={proc.returncode}, {elapsed}s, {len(output)} chars)", GREEN if proc.returncode == 0 else RED)
@@ -181,34 +219,66 @@ def _run_interactive(cmd: list[str], cwd: str, capture_file: str,
     return proc.returncode, output
 
 
+def _build_agent_cmd(agent: str, task_payload: str) -> tuple[list[str], str | None]:
+    """Build command and stdin_text from agents.json config.
+
+    Returns (cmd, stdin_text). stdin_text is None for positional/flag modes.
+
+    Execution modes (from agents.json):
+      - "stdin":      prompt piped via stdin, agent shows interactive TUI
+      - "positional": prompt as last CLI argument
+      - "flag":       prompt via a flag (e.g. -p "prompt")
+    """
+    config = load_agent_config(agent)
+
+    if config:
+        exe = config["command"]
+        exec_cfg = config.get("execution", {})
+        mode = exec_cfg.get("mode", "positional")
+        extra_args = exec_cfg.get("args", [])
+        prompt_flag = exec_cfg.get("prompt_flag", "")
+
+        if mode == "stdin":
+            # Prompt piped via stdin → agent runs interactive TUI, exits on EOF
+            cmd = [exe] + extra_args
+            return cmd, task_payload
+        elif mode == "flag":
+            cmd = [exe] + extra_args + [prompt_flag, task_payload] if prompt_flag else [exe] + extra_args + [task_payload]
+            return cmd, None
+        else:  # positional
+            cmd = [exe] + extra_args + [task_payload]
+            return cmd, None
+
+    # Fallback: hardcoded defaults if agent not in JSON
+    if agent == "claude-code":
+        return ["claude", "--dangerously-skip-permissions"], task_payload
+    elif agent == "codex":
+        return ["codex", task_payload], None
+    elif agent == "gemini-cli":
+        return ["gemini", "-p", task_payload, "-y"], None
+    else:
+        return [], None
+
+
 async def run_agent_cli(role: str, agent: str, task_payload: str, cwd: str,
                         progress_callback=None) -> str:
     """Run a real agent CLI interactively in the pane.
 
-    All agents run via `script` capture in the real terminal.
+    Agent command and execution mode are loaded from agents.json.
+    All agents run via `script` capture — visible in cmux pane.
     No timeout — agents run until they exit naturally.
-    Agents are visible in their cmux pane in real time.
-
-    Commands:
-      - claude-code: claude --dangerously-skip-permissions -p "prompt"
-      - codex:       codex "prompt"
-      - gemini-cli:  gemini -p "prompt" -y
     """
-    if agent == "claude-code":
-        cmd = ["claude", "--dangerously-skip-permissions", "-p", task_payload]
-    elif agent == "codex":
-        cmd = ["codex", task_payload]
-    elif agent == "gemini-cli":
-        cmd = ["gemini", "-p", task_payload, "-y"]
-    else:
+    cmd, stdin_text = _build_agent_cmd(agent, task_payload)
+    if not cmd:
         return await run_agent_mock(role, task_payload)
 
-    log(role, f"executing: {cmd[0]} (cwd: {cwd})", YELLOW)
+    mode_label = "stdin→interactive" if stdin_text else "interactive"
+    log(role, f"executing ({mode_label}): {cmd[0]} (cwd: {cwd})", YELLOW)
     capture_file = f"/tmp/cmux-orchestrate-{role}-{os.getpid()}.log"
 
     try:
         returncode, output = await asyncio.to_thread(
-            _run_interactive, cmd, cwd, capture_file, progress_callback
+            _run_interactive, cmd, cwd, capture_file, progress_callback, stdin_text
         )
 
         if returncode != 0:

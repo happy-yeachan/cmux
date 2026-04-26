@@ -57,31 +57,46 @@ DEFAULT_MOCK_AGENTS = {
     "review": "mock",
 }
 
-# ── Agent registry: known CLI agents and their capabilities ──────────
+# ── Agent registry: loaded from agents.json ──────────────────────────
 
-AGENT_REGISTRY: list[dict] = [
-    {
-        "name": "claude-code",
-        "commands": ["claude"],           # binary names to check
-        "strengths": ["frontend", "fullstack", "refactor", "debug", "docs", "test"],
-        "description": "Strong at UI, architecture, full-stack reasoning",
-        "priority": 1,                    # lower = preferred when tied
-    },
-    {
-        "name": "codex",
-        "commands": ["codex"],
-        "strengths": ["backend", "logic", "algorithm", "api", "database", "test"],
-        "description": "Strong at backend logic, algorithms, API design",
-        "priority": 2,
-    },
-    {
-        "name": "gemini-cli",
-        "commands": ["gemini"],
-        "strengths": ["review", "analysis", "security", "docs", "test"],
-        "description": "Strong at code review, analysis, documentation",
-        "priority": 3,
-    },
-]
+def _load_agent_registry() -> list[dict]:
+    """Load agent registry from agents.json.
+
+    Search order:
+      1. CMUX_ORCHESTRATE_AGENTS env var
+      2. ./agents.json (next to this script)
+      3. ~/.config/cmux-orchestrate/agents.json
+    """
+    config_paths = [
+        Path(os.environ.get("CMUX_ORCHESTRATE_AGENTS", "")),
+        SCRIPT_DIR / "agents.json",
+        Path.home() / ".config" / "cmux-orchestrate" / "agents.json",
+    ]
+    for p in config_paths:
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text())
+                agents = data.get("agents", [])
+                # Normalize: add "commands" field from "command"
+                for a in agents:
+                    if "commands" not in a:
+                        a["commands"] = [a["command"]] if "command" in a else []
+                log(f"loaded {len(agents)} agents from {p}", DIM)
+                return agents
+            except (json.JSONDecodeError, OSError) as e:
+                log(f"failed to load {p}: {e}", RED)
+    return []
+
+
+# Lazy-loaded on first access
+_AGENT_REGISTRY: list[dict] | None = None
+
+
+def get_agent_registry() -> list[dict]:
+    global _AGENT_REGISTRY
+    if _AGENT_REGISTRY is None:
+        _AGENT_REGISTRY = _load_agent_registry()
+    return _AGENT_REGISTRY
 
 # Task keywords → roles mapping
 ROLE_KEYWORDS: dict[str, list[str]] = {
@@ -102,7 +117,7 @@ ROLE_KEYWORDS: dict[str, list[str]] = {
 def detect_available_agents() -> list[dict]:
     """Detect which agent CLIs are installed on the system."""
     available = []
-    for agent in AGENT_REGISTRY:
+    for agent in get_agent_registry():
         for cmd in agent["commands"]:
             if shutil.which(cmd):
                 available.append(agent)
@@ -189,7 +204,7 @@ def print_auto_plan(task: str, available: list[dict], roles: list[str], assignme
     else:
         print(f"    {YELLOW}(none found — using mock){RESET}")
 
-    not_found = [a for a in AGENT_REGISTRY if a not in available]
+    not_found = [a for a in get_agent_registry() if a not in available]
     for agent in not_found:
         cmds = ", ".join(agent["commands"])
         print(f"    {RED}✗{RESET} {DIM}{agent['name']}  ('{cmds}' not in PATH){RESET}")
@@ -213,7 +228,7 @@ def print_auto_plan(task: str, available: list[dict], roles: list[str], assignme
     print(f"\n  {BOLD}Role → Agent assignments:{RESET}")
     for role, agent in assignments.items():
         reason = ""
-        for a in AGENT_REGISTRY:
+        for a in get_agent_registry():
             if a["name"] == agent and role in a["strengths"]:
                 reason = f"  {DIM}(strength match){RESET}"
                 break
