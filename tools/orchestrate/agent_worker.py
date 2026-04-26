@@ -102,15 +102,22 @@ async def run_agent_mock(role: str, task_payload: str) -> str:
     return result
 
 
-def _run_with_pty(cmd: list[str], cwd: str, timeout: float = 300) -> tuple[int, str]:
-    """Run a command with a pseudo-TTY (solves 'stdout is not a terminal')."""
+def _run_with_pty(cmd: list[str], cwd: str, timeout: float = 300,
+                   stdin_tty: bool = False) -> tuple[int, str]:
+    """Run a command with a pseudo-TTY for stdout/stderr.
+
+    Args:
+        stdin_tty: If True, stdin also uses PTY (required by codex).
+                   If False, stdin is /dev/null (claude/gemini need this
+                   to avoid reading from stdin instead of using CLI args).
+    """
     master, slave = pty.openpty()
     try:
         proc = subprocess.Popen(
             cmd,
             stdout=slave,
             stderr=slave,
-            stdin=slave,  # PTY slave so isatty(stdin) = True (required by codex)
+            stdin=slave if stdin_tty else subprocess.DEVNULL,
             cwd=cwd,
         )
     except FileNotFoundError:
@@ -167,17 +174,18 @@ async def run_agent_cli(role: str, agent: str, task_payload: str) -> str:
     All agents are executed via pseudo-TTY to satisfy isatty() checks
     (required by codex, beneficial for others).
     """
-    # Build the CLI command based on agent type.
-    # Each agent has a different flag for non-interactive/headless execution:
-    #   claude-code:  claude --print --output-format text -p "<prompt>"
-    #   codex:        codex "<prompt>"                (positional arg, needs TTY)
-    #   gemini-cli:   gemini -p "<prompt>"            (-p = non-interactive)
+    # Build the CLI command and stdin mode per agent:
+    #   claude-code:  claude --print --output-format text "<prompt>"  (positional arg, stdin=DEVNULL)
+    #   codex:        codex "<prompt>"                               (positional arg, stdin=PTY)
+    #   gemini-cli:   gemini --prompt "<prompt>"                     (--prompt flag, stdin=DEVNULL)
+    stdin_tty = False
     if agent == "claude-code":
-        cmd = ["claude", "--print", "--output-format", "text", "-p", task_payload]
+        cmd = ["claude", "--print", "--output-format", "text", task_payload]
     elif agent == "codex":
         cmd = ["codex", task_payload]
+        stdin_tty = True  # codex requires isatty(stdin)
     elif agent == "gemini-cli":
-        cmd = ["gemini", "-p", task_payload]
+        cmd = ["gemini", "--prompt", task_payload]
     else:
         return await run_agent_mock(role, task_payload)
 
@@ -187,7 +195,7 @@ async def run_agent_cli(role: str, agent: str, task_payload: str) -> str:
 
     try:
         returncode, output = await asyncio.wait_for(
-            asyncio.to_thread(_run_with_pty, cmd, cwd, timeout),
+            asyncio.to_thread(_run_with_pty, cmd, cwd, timeout, stdin_tty),
             timeout=timeout + 10,
         )
 
