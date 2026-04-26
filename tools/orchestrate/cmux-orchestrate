@@ -508,19 +508,98 @@ main() {
     echo "$PLAN_JSON" | jq -r '.phases[] | "  Phase: \(.name) → \([.tasks[] | "\(.role)=\(.agent)"] | join(", "))"'
     echo ""
 
-    # Step 2: Execute phases
+    # Step 2: Execute phases — main agent decides next phase after each one
     local num_phases
     num_phases=$(echo "$PLAN_JSON" | jq '.phases | length')
     local prev_context=""
+    local phase_count=0
 
     for ((p=0; p<num_phases; p++)); do
         local phase_json
         phase_json=$(echo "$PLAN_JSON" | jq ".phases[$p]")
+        phase_count=$((phase_count + 1))
 
-        run_phase "$phase_json" "$((p + 1))" "$num_phases" "$prev_context"
+        run_phase "$phase_json" "$phase_count" "$num_phases" "$prev_context"
 
-        # Collect context for next phase
+        # Collect context from this phase
         prev_context=$(collect_context)
+
+        # After each phase (except the last), main agent reviews and decides next phase
+        local remaining=$((num_phases - p - 1))
+        if [[ $remaining -gt 0 ]] && ! $MOCK; then
+            log "${CYN}main agent reviewing phase results...${RST}"
+
+            local next_phase_json
+            next_phase_json=$(echo "$PLAN_JSON" | jq ".phases[$((p + 1))]")
+            local next_name
+            next_name=$(echo "$next_phase_json" | jq -r '.name')
+
+            local agent_list
+            agent_list=$(printf '%s, ' "${AVAILABLE_AGENTS[@]}")
+            agent_list="${agent_list%, }"
+
+            local review_prompt="You are the orchestrator for a multi-agent coding system.
+
+AVAILABLE AGENTS: ${agent_list}
+
+ORIGINAL TASK: ${TASK}
+
+COMPLETED SO FAR:
+${prev_context}
+
+THE ORIGINAL PLAN says the next phase is \"${next_name}\" with these tasks:
+$(echo "$next_phase_json" | jq -r '.tasks[] | "  - \(.role) (\(.agent)): \(.prompt[:100])..."')
+
+Based on what was actually produced, do you want to:
+1. PROCEED with the planned next phase as-is
+2. MODIFY the next phase (change agents, prompts, or roles)
+3. ADD an unplanned phase before continuing
+
+Respond with ONLY a JSON object:
+- To proceed: {\"action\": \"proceed\"}
+- To modify:  {\"action\": \"modify\", \"phase\": {\"name\": \"...\", \"tasks\": [{\"role\": \"...\", \"agent\": \"...\", \"prompt\": \"...\"}]}}
+- To add:     {\"action\": \"add\", \"phase\": {\"name\": \"...\", \"tasks\": [{\"role\": \"...\", \"agent\": \"...\", \"prompt\": \"...\"}]}}"
+
+            local decision
+            decision=$(run_in_pane "reviewer-p$((p+1))" "claude --dangerously-skip-permissions < __PROMPT_FILE__" "$review_prompt") || true
+
+            # Parse decision
+            local action_json
+            action_json=$(echo "$decision" | sed -n '/^{/,/^}/p' | head -20)
+            if ! echo "$action_json" | jq . >/dev/null 2>&1; then
+                action_json=$(echo "$decision" | sed -n '/```json/,/```/p' | sed '1d;$d')
+            fi
+
+            local action
+            action=$(echo "$action_json" | jq -r '.action // "proceed"' 2>/dev/null || echo "proceed")
+
+            case "$action" in
+                modify)
+                    log "${YLW}main agent modified next phase${RST}"
+                    local modified
+                    modified=$(echo "$action_json" | jq '.phase' 2>/dev/null)
+                    if echo "$modified" | jq . >/dev/null 2>&1; then
+                        # Replace next phase in plan
+                        PLAN_JSON=$(echo "$PLAN_JSON" | jq ".phases[$((p + 1))] = $modified")
+                        echo "$modified" | jq -r '"  Modified → \(.name): \([.tasks[] | "\(.role)=\(.agent)"] | join(", "))"'
+                    fi
+                    ;;
+                add)
+                    log "${YLW}main agent added a new phase${RST}"
+                    local new_phase
+                    new_phase=$(echo "$action_json" | jq '.phase' 2>/dev/null)
+                    if echo "$new_phase" | jq . >/dev/null 2>&1; then
+                        # Insert new phase before the next planned one
+                        PLAN_JSON=$(echo "$PLAN_JSON" | jq ".phases |= .[:$((p+1))] + [$new_phase] + .[$((p+1)):]")
+                        num_phases=$((num_phases + 1))
+                        echo "$new_phase" | jq -r '"  Added → \(.name): \([.tasks[] | "\(.role)=\(.agent)"] | join(", "))"'
+                    fi
+                    ;;
+                *)
+                    log "${GRN}main agent: proceed as planned${RST}"
+                    ;;
+            esac
+        fi
     done
 
     # Step 3: Report
