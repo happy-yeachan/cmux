@@ -110,7 +110,7 @@ def _run_with_pty(cmd: list[str], cwd: str, timeout: float = 300) -> tuple[int, 
             cmd,
             stdout=slave,
             stderr=slave,
-            stdin=subprocess.DEVNULL,
+            stdin=slave,  # PTY slave so isatty(stdin) = True (required by codex)
             cwd=cwd,
         )
     except FileNotFoundError:
