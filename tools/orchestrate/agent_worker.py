@@ -4,21 +4,24 @@ cmux orchestrate — Agent Worker
 
 Generic worker that runs in a cmux split pane. Connects to the IPC
 broker, registers with a role, listens for tasks, executes them via
-the configured agent CLI (headless), and sends results back.
+the configured agent CLI (interactive, in-pane), and sends results back.
+
+All agents run interactively in the cmux pane via `script` capture.
+The user can watch each agent work in real time. Agents create files
+directly in the --cwd project directory.
 
 Usage:
-    python3 agent_worker.py --role frontend --agent claude-code
-    python3 agent_worker.py --role backend  --agent codex
-    python3 agent_worker.py --role review   --agent gemini-cli
-    python3 agent_worker.py --role frontend --agent mock   # (mock mode)
+    python3 agent_worker.py --role frontend --agent claude-code --cwd /tmp/project
+    python3 agent_worker.py --role backend  --agent codex --cwd /tmp/project
+    python3 agent_worker.py --role review   --agent gemini-cli --cwd /tmp/project
+    python3 agent_worker.py --role frontend --agent mock
 """
 
 import argparse
 import asyncio
 import json
 import os
-import pty
-import select
+import re
 import signal
 import subprocess
 import sys
@@ -55,6 +58,7 @@ SOCKET_PATH = os.environ.get(
     "CMUX_ORCHESTRATE_SOCK", "/tmp/cmux-orchestrate.sock"
 )
 
+AGENT_TIMEOUT = int(os.environ.get("CMUX_ORCHESTRATE_TIMEOUT", "600"))
 
 _CURRENT_AGENT: str = ""
 
@@ -67,19 +71,27 @@ def log(role: str, msg: str, color: str = "") -> None:
     print(f"{DIM}{ts}{RESET} {BOLD}{rc}[{role}]{RESET}{agent_tag} {c}{msg}{RESET}", flush=True)
 
 
-def banner(role: str, agent: str) -> None:
+def banner(role: str, agent: str, cwd: str) -> None:
     rc = ROLE_COLORS.get(role, WHITE)
-    al = AGENT_LABELS.get(agent, agent)
     print(f"""
 {BOLD}{rc}╔══════════════════════════════════════════╗
 ║  cmux orchestrate — Agent Worker         ║
 ║  Role:  {role:<33s}║
 ║  Agent: {agent:<33s}║
+║  CWD:   {cwd[:33]:<33s}║
 ╚══════════════════════════════════════════╝{RESET}
 """, flush=True)
 
 
-# ── Agent execution backends ─────────────────────────────────────────
+def _strip_ansi(text: str) -> str:
+    """Strip ANSI escape sequences from text."""
+    text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
+    text = re.sub(r"\x1b\].*?\x07", "", text)
+    text = re.sub(r"\r", "", text)
+    return text
+
+
+# ── Agent execution ──────────────────────────────────────────────────
 
 async def run_agent_mock(role: str, task_payload: str) -> str:
     """Mock agent — simulates processing with colored output."""
@@ -102,81 +114,16 @@ async def run_agent_mock(role: str, task_payload: str) -> str:
     return result
 
 
-def _run_with_pty(cmd: list[str], cwd: str, timeout: float = 300,
-                   stdin_tty: bool = False) -> tuple[int, str]:
-    """Run a command with a pseudo-TTY for stdout/stderr.
-
-    Args:
-        stdin_tty: If True, stdin also uses PTY (required by codex).
-                   If False, stdin is /dev/null (claude/gemini need this
-                   to avoid reading from stdin instead of using CLI args).
-    """
-    master, slave = pty.openpty()
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=slave,
-            stderr=slave,
-            stdin=slave if stdin_tty else subprocess.DEVNULL,
-            cwd=cwd,
-        )
-    except FileNotFoundError:
-        os.close(master)
-        os.close(slave)
-        raise
-    os.close(slave)
-
-    output_chunks: list[bytes] = []
-    deadline = time.time() + timeout
-
-    while proc.poll() is None:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            proc.kill()
-            proc.wait()
-            os.close(master)
-            raise TimeoutError(f"Process timed out after {timeout}s")
-        r, _, _ = select.select([master], [], [], min(remaining, 0.5))
-        if r:
-            try:
-                output_chunks.append(os.read(master, 8192))
-            except OSError:
-                break
-
-    # Drain remaining output
-    while True:
-        r, _, _ = select.select([master], [], [], 0.1)
-        if not r:
-            break
-        try:
-            data = os.read(master, 8192)
-            if not data:
-                break
-            output_chunks.append(data)
-        except OSError:
-            break
-
-    os.close(master)
-    text = b"".join(output_chunks).decode(errors="replace").strip()
-    # Strip ANSI escape sequences for cleaner output
-    import re
-    text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
-    text = re.sub(r"\x1b\].*?\x07", "", text)
-    return proc.returncode, text
-
-
-AGENT_TIMEOUT = int(os.environ.get("CMUX_ORCHESTRATE_TIMEOUT", "600"))
-
-
 def _run_interactive(cmd: list[str], cwd: str, capture_file: str,
                      timeout: float = 600) -> tuple[int, str]:
     """Run a command interactively in the real terminal, capturing output via `script`.
 
-    Used for agents like codex that require a real TTY and don't support
-    headless mode. The agent runs visibly in the pane while `script`
-    records all output to a file.
+    The agent runs visibly in the cmux pane while `script` records all
+    output to a file. This gives agents full TTY access so they can
+    create files, use tools, and interact with the terminal.
+
+    macOS script syntax: script -q <file> <command> [args...]
     """
-    # macOS script: script -q <file> <command> [args...]
     script_cmd = ["script", "-q", capture_file] + cmd
     proc = subprocess.Popen(script_cmd, cwd=cwd)
 
@@ -195,53 +142,36 @@ def _run_interactive(cmd: list[str], cwd: str, capture_file: str,
     finally:
         Path(capture_file).unlink(missing_ok=True)
 
-    # Strip ANSI escape sequences
-    import re
-    text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", raw)
-    text = re.sub(r"\x1b\].*?\x07", "", text)
-    text = re.sub(r"\r", "", text)
-    return proc.returncode, text.strip()
+    return proc.returncode, _strip_ansi(raw).strip()
 
 
-async def run_agent_cli(role: str, agent: str, task_payload: str) -> str:
-    """Run a real agent CLI and capture output.
+async def run_agent_cli(role: str, agent: str, task_payload: str, cwd: str) -> str:
+    """Run a real agent CLI interactively in the pane and capture output.
 
-    Execution mode per agent:
-      - claude-code:  headless (--print), output via PTY capture
-      - gemini-cli:   headless (--prompt), output via PTY capture
-      - codex:        interactive in pane, output via `script` capture
+    All agents run via `script` capture in the real terminal:
+      - claude-code: claude --print --dangerously-skip-permissions "prompt"
+      - codex:       codex "prompt"
+      - gemini-cli:  gemini -p "prompt" -y
     """
     timeout = AGENT_TIMEOUT
-    cwd = os.environ.get("CMUX_ORCHESTRATE_CWD", os.getcwd())
 
     if agent == "claude-code":
-        cmd = ["claude", "--print", "--output-format", "text", task_payload]
-        mode = "headless"
+        cmd = ["claude", "--print", "--dangerously-skip-permissions", task_payload]
     elif agent == "codex":
         cmd = ["codex", task_payload]
-        mode = "interactive"
     elif agent == "gemini-cli":
-        cmd = ["gemini", "--prompt", task_payload]
-        mode = "headless"
+        cmd = ["gemini", "-p", task_payload, "-y"]
     else:
         return await run_agent_mock(role, task_payload)
 
-    log(role, f"executing ({mode}): {cmd[0]} ... (timeout: {timeout}s)", YELLOW)
+    log(role, f"executing: {cmd[0]} ... (timeout: {timeout}s, cwd: {cwd})", YELLOW)
+    capture_file = f"/tmp/cmux-orchestrate-{role}-{os.getpid()}.log"
 
     try:
-        if mode == "interactive":
-            # Run in real terminal with script capture
-            capture_file = f"/tmp/cmux-orchestrate-{role}-{os.getpid()}.log"
-            returncode, output = await asyncio.wait_for(
-                asyncio.to_thread(_run_interactive, cmd, cwd, capture_file, timeout),
-                timeout=timeout + 10,
-            )
-        else:
-            # Headless via PTY (stdin=DEVNULL)
-            returncode, output = await asyncio.wait_for(
-                asyncio.to_thread(_run_with_pty, cmd, cwd, timeout, False),
-                timeout=timeout + 10,
-            )
+        returncode, output = await asyncio.wait_for(
+            asyncio.to_thread(_run_interactive, cmd, cwd, capture_file, timeout),
+            timeout=timeout + 10,
+        )
 
         if returncode != 0:
             log(role, f"agent exited with code {returncode}", RED)
@@ -263,9 +193,10 @@ async def run_agent_cli(role: str, agent: str, task_payload: str) -> str:
 # ── Broker communication ─────────────────────────────────────────────
 
 class WorkerClient:
-    def __init__(self, role: str, agent: str) -> None:
+    def __init__(self, role: str, agent: str, cwd: str) -> None:
         self.role = role
         self.agent = agent
+        self.cwd = cwd
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
         self._running = True
@@ -328,7 +259,7 @@ class WorkerClient:
                 if self.agent == "mock":
                     result = await run_agent_mock(self.role, payload)
                 else:
-                    result = await run_agent_cli(self.role, self.agent, payload)
+                    result = await run_agent_cli(self.role, self.agent, payload, self.cwd)
 
                 # Send result back (include agent/model info)
                 await self.send({
@@ -370,6 +301,10 @@ async def main() -> None:
         "--socket", default=None,
         help="Broker socket path (default: /tmp/cmux-orchestrate.sock)"
     )
+    parser.add_argument(
+        "--cwd", default=None,
+        help="Working directory for agent execution"
+    )
     args = parser.parse_args()
 
     if args.socket:
@@ -379,9 +314,11 @@ async def main() -> None:
     global _CURRENT_AGENT
     _CURRENT_AGENT = args.agent
 
-    banner(args.role, args.agent)
+    cwd = args.cwd or os.getcwd()
 
-    client = WorkerClient(role=args.role, agent=args.agent)
+    banner(args.role, args.agent, cwd)
+
+    client = WorkerClient(role=args.role, agent=args.agent, cwd=cwd)
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
