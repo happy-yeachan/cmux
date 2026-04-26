@@ -102,17 +102,21 @@ async def run_agent_mock(role: str, task_payload: str) -> str:
 
 async def run_agent_cli(role: str, agent: str, task_payload: str) -> str:
     """Run a real agent CLI in headless mode and capture output."""
-    # Build the CLI command based on agent type
+    # Build the CLI command based on agent type.
+    # Each agent has a different flag for non-interactive/headless execution:
+    #   claude-code:  claude --print --output-format text "<prompt>"
+    #   codex:        codex "<prompt>"                (positional arg)
+    #   gemini-cli:   gemini -p "<prompt>"            (-p = non-interactive)
     if agent == "claude-code":
-        cmd = ["claude", "--print", "--output-format", "text", task_payload]
+        cmd = ["claude", "--print", "--output-format", "text", "-p", task_payload]
     elif agent == "codex":
-        cmd = ["codex", "--quiet", task_payload]
+        cmd = ["codex", task_payload]
     elif agent == "gemini-cli":
-        cmd = ["gemini", "--non-interactive", task_payload]
+        cmd = ["gemini", "-p", task_payload]
     else:
         return await run_agent_mock(role, task_payload)
 
-    log(role, f"executing: {' '.join(cmd[:3])}...", YELLOW)
+    log(role, f"executing: {cmd[0]} {' '.join(cmd[1:3])}...", YELLOW)
 
     try:
         proc = await asyncio.create_subprocess_exec(
