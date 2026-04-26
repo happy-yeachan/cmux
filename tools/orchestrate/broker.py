@@ -92,6 +92,12 @@ class Broker:
                     log(f"result {msg.get('from', '?')} → {target}", GREEN)
                     await self._route(msg, target)
 
+                elif mtype == "progress":
+                    # Route progress snapshots to orchestrator
+                    sender = msg.get("from", "?")
+                    log(f"progress {sender} → orchestrator", DIM)
+                    await self._route(msg, "orchestrator")
+
                 elif mtype == "broadcast":
                     sender = msg.get("from", "?")
                     log(f"broadcast from {sender}", BLUE)

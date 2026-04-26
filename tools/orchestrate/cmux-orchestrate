@@ -536,6 +536,7 @@ class OrchestrateSession:
         self._dispatched_prompts: dict[str, str] = {}  # role -> prompt sent
         self._dispatch_time: float = 0.0
         self._ai_prompts: dict[str, str] = {}  # AI-generated prompts (if available)
+        self._snapshots: dict[str, str] = {}  # progress snapshots from workers
         self._synthesis: str | None = None  # AI synthesis of results
         self._phases: list[dict] | None = None  # phased execution plan
 
@@ -739,12 +740,27 @@ class OrchestrateSession:
 
             phase_roles = [t["role"] for t in phase_tasks]
 
-            # Inject previous phase results into prompts for later phases
+            # Inject previous phase results + project state into later phases
             if phase_idx > 0 and self._results:
-                context = "\n\n--- RESULTS FROM PREVIOUS PHASES ---\n"
+                context = "\n\n--- CONTEXT FROM PREVIOUS PHASES ---\n"
                 for r, v in self._results.items():
                     if not v.startswith("[ERROR]"):
-                        context += f"\n[{r}]:\n{v[:2000]}\n"
+                        context += f"\n[{r}] output:\n{v[:5000]}\n"
+
+                # Include current project file listing
+                try:
+                    file_list = subprocess.run(
+                        ["find", self.cwd, "-type", "f", "-maxdepth", "4",
+                         "-not", "-path", "*/node_modules/*",
+                         "-not", "-path", "*/.git/*",
+                         "-not", "-path", "*/__pycache__/*"],
+                        capture_output=True, text=True, timeout=5
+                    ).stdout.strip()
+                    if file_list:
+                        context += f"\n[project files in {self.cwd}]:\n{file_list}\n"
+                except Exception:
+                    pass
+
                 for t in phase_tasks:
                     t["prompt"] = t.get("prompt", "") + context
 
@@ -792,40 +808,45 @@ class OrchestrateSession:
                 writer.write((json.dumps(msg) + "\n").encode())
                 await writer.drain()
 
-            # Collect results for this phase
+            # Collect results for this phase (no timeout — wait for natural exit)
             pending = set(phase_roles)
-            log(f"waiting for {len(pending)} results...", YELLOW)
+            log(f"waiting for {len(pending)} results (no timeout)...", YELLOW)
 
-            try:
-                while pending:
-                    line = await asyncio.wait_for(reader.readline(), timeout=650)
-                    if not line:
-                        break
-                    msg = json.loads(line.decode().strip())
+            while pending:
+                line = await reader.readline()
+                if not line:
+                    log("broker connection lost", RED)
+                    break
+                msg = json.loads(line.decode().strip())
 
-                    if msg.get("type") == "result":
-                        from_role = msg.get("from", "?")
-                        if from_role not in pending:
-                            continue
-                        from_agent = msg.get("agent", self.agents.get(from_role, "?"))
-                        payload = msg.get("payload", "")
-                        elapsed = time.time() - dispatch_time
+                if msg.get("type") == "result":
+                    from_role = msg.get("from", "?")
+                    if from_role not in pending:
+                        continue
+                    from_agent = msg.get("agent", self.agents.get(from_role, "?"))
+                    payload = msg.get("payload", "")
+                    elapsed = time.time() - dispatch_time
 
-                        self._results[from_role] = payload
-                        self._result_agents[from_role] = from_agent
-                        self._result_times[from_role] = elapsed
-                        pending.discard(from_role)
+                    self._results[from_role] = payload
+                    self._result_agents[from_role] = from_agent
+                    self._result_times[from_role] = elapsed
+                    pending.discard(from_role)
 
-                        log(
-                            f"  result from {BOLD}{from_role}{RESET} "
-                            f"({BOLD}{from_agent}{RESET}, {elapsed:.1f}s) "
-                            f"— {len(pending)} remaining",
-                            GREEN,
-                        )
-                        snippet = payload[:120].replace("\n", " ")
-                        log(f"    └─ {snippet}{'...' if len(payload) > 120 else ''}", DIM)
-            except asyncio.TimeoutError:
-                log(f"  timeout — missing: {', '.join(pending)}", RED)
+                    log(
+                        f"  result from {BOLD}{from_role}{RESET} "
+                        f"({BOLD}{from_agent}{RESET}, {elapsed:.1f}s) "
+                        f"— {len(pending)} remaining",
+                        GREEN,
+                    )
+                    snippet = payload[:120].replace("\n", " ")
+                    log(f"    └─ {snippet}{'...' if len(payload) > 120 else ''}", DIM)
+
+                elif msg.get("type") == "progress":
+                    from_role = msg.get("from", "?")
+                    snapshot = msg.get("snapshot", "")
+                    self._snapshots[from_role] = snapshot
+                    elapsed = time.time() - dispatch_time
+                    log(f"  progress from {from_role} ({elapsed:.0f}s, {len(snapshot)} chars)", DIM)
 
             # Close completed panes
             log(f"phase '{phase_name}' complete — closing panes", GREEN)

@@ -4,16 +4,21 @@ cmux orchestrate — Agent Worker
 
 Generic worker that runs in a cmux split pane. Connects to the IPC
 broker, registers with a role, listens for tasks, executes them via
-the configured agent CLI (interactive, in-pane), and sends results back.
+the configured agent CLI (interactive, visible in-pane), and sends
+results back through the broker.
 
 All agents run interactively in the cmux pane via `script` capture.
 The user can watch each agent work in real time. Agents create files
 directly in the --cwd project directory.
 
+No hard timeout — workers use health-check (capture file activity)
+to detect agent liveness and send periodic progress snapshots to
+the broker for cross-phase context sharing.
+
 Usage:
-    python3 agent_worker.py --role frontend --agent claude-code --cwd /tmp/project
-    python3 agent_worker.py --role backend  --agent codex --cwd /tmp/project
-    python3 agent_worker.py --role review   --agent gemini-cli --cwd /tmp/project
+    python3 agent_worker.py --role frontend --agent claude-code --cwd ~/projects/app
+    python3 agent_worker.py --role backend  --agent codex --cwd ~/projects/app
+    python3 agent_worker.py --role review   --agent gemini-cli --cwd ~/projects/app
     python3 agent_worker.py --role frontend --agent mock
 """
 
@@ -47,18 +52,14 @@ ROLE_COLORS = {
     "orchestrator": MAGENTA,
 }
 
-AGENT_LABELS = {
-    "claude-code": f"{BLUE}Claude Code{RESET}",
-    "codex": f"{GREEN}Codex{RESET}",
-    "gemini-cli": f"{CYAN}Gemini CLI{RESET}",
-    "mock": f"{DIM}Mock Agent{RESET}",
-}
-
 SOCKET_PATH = os.environ.get(
     "CMUX_ORCHESTRATE_SOCK", "/tmp/cmux-orchestrate.sock"
 )
 
-AGENT_TIMEOUT = int(os.environ.get("CMUX_ORCHESTRATE_TIMEOUT", "600"))
+# Health-check interval (seconds)
+HEALTH_CHECK_INTERVAL = 10
+# Snapshot send interval (seconds) — how often to push progress to broker
+SNAPSHOT_INTERVAL = 30
 
 _CURRENT_AGENT: str = ""
 
@@ -91,11 +92,20 @@ def _strip_ansi(text: str) -> str:
     return text
 
 
+def _read_capture(capture_file: str) -> str:
+    """Read and clean capture file contents."""
+    try:
+        raw = Path(capture_file).read_text(errors="replace")
+        return _strip_ansi(raw).strip()
+    except FileNotFoundError:
+        return ""
+
+
 # ── Agent execution ──────────────────────────────────────────────────
 
 async def run_agent_mock(role: str, task_payload: str) -> str:
     """Mock agent — simulates processing with colored output."""
-    log(role, f"processing task...", YELLOW)
+    log(role, "processing task...", YELLOW)
     steps = [
         ("Analyzing requirements...", 1.0),
         ("Generating code...", 1.5),
@@ -110,53 +120,82 @@ async def run_agent_mock(role: str, task_payload: str) -> str:
         f"[{role}] Completed task: {task_payload[:80]}... "
         f"Generated {role} component with 42 lines of code."
     )
-    log(role, f"  └─ Done ✓", GREEN)
+    log(role, "  └─ Done ✓", GREEN)
     return result
 
 
 def _run_interactive(cmd: list[str], cwd: str, capture_file: str,
-                     timeout: float = 600) -> tuple[int, str]:
-    """Run a command interactively in the real terminal, capturing output via `script`.
+                     progress_callback=None) -> tuple[int, str]:
+    """Run a command interactively in the real terminal with health-check.
 
-    The agent runs visibly in the cmux pane while `script` records all
-    output to a file. This gives agents full TTY access so they can
-    create files, use tools, and interact with the terminal.
+    No hard timeout. The agent runs until it exits naturally.
+    Health-check monitors capture file activity. Progress snapshots
+    are sent periodically via the callback.
 
     macOS script syntax: script -q <file> <command> [args...]
     """
     script_cmd = ["script", "-q", capture_file] + cmd
     proc = subprocess.Popen(script_cmd, cwd=cwd)
 
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        raise TimeoutError(f"Process timed out after {timeout}s")
+    last_size = 0
+    stall_checks = 0
+    last_snapshot_time = time.time()
+    start_time = time.time()
 
-    # Read captured output
-    try:
-        raw = Path(capture_file).read_text(errors="replace")
-    except FileNotFoundError:
-        raw = ""
-    finally:
-        Path(capture_file).unlink(missing_ok=True)
+    while proc.poll() is None:
+        time.sleep(HEALTH_CHECK_INTERVAL)
 
-    return proc.returncode, _strip_ansi(raw).strip()
+        # Health-check: monitor capture file size
+        try:
+            current_size = Path(capture_file).stat().st_size
+        except FileNotFoundError:
+            current_size = 0
+
+        elapsed = int(time.time() - start_time)
+
+        if current_size > last_size:
+            stall_checks = 0
+            delta = current_size - last_size
+            log("", f"  health: active (+{delta}B, {elapsed}s elapsed)", DIM)
+            last_size = current_size
+        else:
+            stall_checks += 1
+            if stall_checks % 6 == 0:  # every ~60s of no activity
+                log("", f"  health: idle for {stall_checks * HEALTH_CHECK_INTERVAL}s ({elapsed}s elapsed)", YELLOW)
+
+        # Send progress snapshot periodically
+        now = time.time()
+        if progress_callback and (now - last_snapshot_time) >= SNAPSHOT_INTERVAL:
+            snapshot = _read_capture(capture_file)
+            if snapshot:
+                progress_callback(snapshot[-3000:])  # last 3000 chars
+            last_snapshot_time = now
+
+    # Read final output
+    output = _read_capture(capture_file)
+    Path(capture_file).unlink(missing_ok=True)
+
+    elapsed = int(time.time() - start_time)
+    log("", f"  agent exited (code={proc.returncode}, {elapsed}s, {len(output)} chars)", GREEN if proc.returncode == 0 else RED)
+
+    return proc.returncode, output
 
 
-async def run_agent_cli(role: str, agent: str, task_payload: str, cwd: str) -> str:
-    """Run a real agent CLI interactively in the pane and capture output.
+async def run_agent_cli(role: str, agent: str, task_payload: str, cwd: str,
+                        progress_callback=None) -> str:
+    """Run a real agent CLI interactively in the pane.
 
-    All agents run via `script` capture in the real terminal:
-      - claude-code: claude --print --dangerously-skip-permissions "prompt"
+    All agents run via `script` capture in the real terminal.
+    No timeout — agents run until they exit naturally.
+    Agents are visible in their cmux pane in real time.
+
+    Commands:
+      - claude-code: claude --dangerously-skip-permissions -p "prompt"
       - codex:       codex "prompt"
       - gemini-cli:  gemini -p "prompt" -y
     """
-    timeout = AGENT_TIMEOUT
-
     if agent == "claude-code":
-        cmd = ["claude", "--print", "--dangerously-skip-permissions", task_payload]
+        cmd = ["claude", "--dangerously-skip-permissions", "-p", task_payload]
     elif agent == "codex":
         cmd = ["codex", task_payload]
     elif agent == "gemini-cli":
@@ -164,13 +203,12 @@ async def run_agent_cli(role: str, agent: str, task_payload: str, cwd: str) -> s
     else:
         return await run_agent_mock(role, task_payload)
 
-    log(role, f"executing: {cmd[0]} ... (timeout: {timeout}s, cwd: {cwd})", YELLOW)
+    log(role, f"executing: {cmd[0]} (cwd: {cwd})", YELLOW)
     capture_file = f"/tmp/cmux-orchestrate-{role}-{os.getpid()}.log"
 
     try:
-        returncode, output = await asyncio.wait_for(
-            asyncio.to_thread(_run_interactive, cmd, cwd, capture_file, timeout),
-            timeout=timeout + 10,
+        returncode, output = await asyncio.to_thread(
+            _run_interactive, cmd, cwd, capture_file, progress_callback
         )
 
         if returncode != 0:
@@ -182,9 +220,6 @@ async def run_agent_cli(role: str, agent: str, task_payload: str, cwd: str) -> s
         log(role, f"agent completed ({len(output)} chars)", GREEN)
         return output
 
-    except (TimeoutError, asyncio.TimeoutError):
-        log(role, f"agent timed out ({timeout}s)", RED)
-        return f"[ERROR] {agent} timed out after {timeout}s"
     except FileNotFoundError:
         log(role, f"'{cmd[0]}' not found — falling back to mock", RED)
         return await run_agent_mock(role, task_payload)
@@ -219,6 +254,12 @@ class WorkerClient:
         assert self.writer is not None
         self.writer.write((json.dumps(msg) + "\n").encode())
         await self.writer.drain()
+
+    def send_sync(self, msg: dict) -> None:
+        """Synchronous send for use from non-async threads (progress callback)."""
+        if self.writer and not self.writer.is_closing():
+            data = (json.dumps(msg) + "\n").encode()
+            self.writer.write(data)
 
     async def recv(self) -> dict | None:
         assert self.reader is not None
@@ -255,11 +296,22 @@ class WorkerClient:
                 log(self.role, f"received task from {sender}", CYAN)
                 log(self.role, f"  task: {payload[:100]}", WHITE)
 
+                # Progress callback sends snapshots through broker
+                def on_progress(snapshot: str):
+                    self.send_sync({
+                        "type": "progress",
+                        "from": self.role,
+                        "snapshot": snapshot,
+                    })
+
                 # Execute via configured agent
                 if self.agent == "mock":
                     result = await run_agent_mock(self.role, payload)
                 else:
-                    result = await run_agent_cli(self.role, self.agent, payload, self.cwd)
+                    result = await run_agent_cli(
+                        self.role, self.agent, payload, self.cwd,
+                        progress_callback=on_progress,
+                    )
 
                 # Send result back (include agent/model info)
                 await self.send({
