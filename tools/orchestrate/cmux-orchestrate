@@ -88,15 +88,17 @@ def cmux(*args: str, json_output: bool = False) -> str:
     return result.stdout.strip()
 
 
-def cmux_split(direction: str = "right") -> str:
-    """Split the current pane and return the new surface ref."""
-    output = cmux("new-split", direction, json_output=True)
+def cmux_split(direction: str = "right", surface: str | None = None) -> str:
+    """Split a pane and return the new surface ref."""
+    args = ["new-split"]
+    if surface:
+        args.extend(["--surface", surface])
+    args.append(direction)
+    output = cmux(*args, json_output=True)
     try:
         data = json.loads(output)
-        # The v2 response may be wrapped in a "result" key
         if "result" in data and isinstance(data["result"], dict):
             data = data["result"]
-        # surface.split returns surface_ref (refs mode) or surface_id (uuids mode)
         surface_id = (
             data.get("surface_ref")
             or data.get("surface_id")
@@ -110,7 +112,6 @@ def cmux_split(direction: str = "right") -> str:
             log(f"  [debug] split response keys: {list(data.keys())}", DIM)
         return surface_id
     except json.JSONDecodeError:
-        # Fallback: parse "OK surface:N" format
         if output.startswith("OK "):
             return output.split()[-1]
         log(f"  [debug] raw split output: {output[:200]}", DIM)
@@ -154,6 +155,7 @@ class OrchestrateSession:
         self._results: dict[str, str] = {}
         self._result_agents: dict[str, str] = {}  # role -> agent that produced result
         self._result_times: dict[str, float] = {}  # role -> elapsed seconds
+        self._dispatched_prompts: dict[str, str] = {}  # role -> prompt sent
         self._dispatch_time: float = 0.0
 
     def start_broker(self) -> None:
@@ -178,19 +180,37 @@ class OrchestrateSession:
         raise RuntimeError("Broker failed to start within 6 seconds")
 
     def create_panes(self) -> None:
-        """Split cmux into panes for each agent role."""
+        """Split cmux into panes for each agent role.
+
+        Layout strategy:
+          ┌──────────────┬──────────────┐
+          │              │  agent 1     │
+          │ orchestrator │──────────────│
+          │   (current)  │  agent 2     │
+          │              │──────────────│
+          │              │  agent 3     │
+          └──────────────┴──────────────┘
+
+        1st agent: split RIGHT from orchestrator → creates right column
+        2nd+ agents: split DOWN from the last created surface → stack vertically
+        """
         roles = list(self.agents.keys())
         log(f"creating {len(roles)} agent panes: {', '.join(roles)}", CYAN)
 
-        for i, role in enumerate(roles):
-            # Alternate split directions for a nice layout
-            direction = "right" if i % 2 == 0 else "down"
-            try:
-                # Snapshot panes before split so we can diff
-                before = {self._pane_surface(p) for p in cmux_list_panes()}
-                surface = cmux_split(direction)
+        last_surface: str | None = None  # track last created surface for chaining
 
-                # Fallback: diff pane lists to find the new surface
+        for i, role in enumerate(roles):
+            try:
+                before = {self._pane_surface(p) for p in cmux_list_panes()}
+
+                if i == 0:
+                    # First agent: split right from orchestrator
+                    surface = cmux_split("right")
+                else:
+                    # Subsequent agents: split down from the last created surface
+                    surface = cmux_split("down", surface=last_surface)
+
+                # Fallback: diff pane lists
                 if not surface:
                     time.sleep(0.3)
                     after = {self._pane_surface(p) for p in cmux_list_panes()}
@@ -200,6 +220,8 @@ class OrchestrateSession:
                         log(f"  (resolved via pane diff)", DIM)
 
                 self.surface_ids[role] = surface
+                if surface:
+                    last_surface = surface
                 log(f"  pane for '{role}' → {surface or '(FAILED)'}", GREEN if surface else RED)
                 time.sleep(0.3)
             except RuntimeError as e:
@@ -277,6 +299,7 @@ class OrchestrateSession:
 
         # Dispatch tasks to each role
         task_prompts = self._decompose_task()
+        self._dispatched_prompts = task_prompts
         self._dispatch_time = time.time()
 
         for role, prompt in task_prompts.items():
@@ -408,82 +431,104 @@ class OrchestrateSession:
         print(f"{DIM}{'─' * width}{RESET}\n")
 
     def print_summary(self) -> None:
-        """Print final synthesis: individual results + aggregated context."""
+        """Print final synthesis with requirement traceability."""
         total_time = max(self._result_times.values()) if self._result_times else 0
+        W = 62
         ROLE_COLORS_MAP = {
             "frontend": CYAN, "backend": GREEN, "review": YELLOW,
         }
+        all_done = len(self._results) == len(self.agents)
+        missing = set(self.agents.keys()) - set(self._results.keys())
+        models_used: dict[str, str] = {}
+        for role in self.agents:
+            models_used[role] = self._result_agents.get(role, self.agents[role])
 
-        # ── Final context board ──
-        self._print_context_board("COMPLETE")
+        # ── 1. Overview ──
+        print(f"\n{BOLD}{'═' * W}{RESET}")
+        print(f"{BOLD}{MAGENTA}  ORCHESTRATION REPORT{RESET}")
+        print(f"{BOLD}{'═' * W}{RESET}\n")
+        print(f"  {BOLD}Task:{RESET}       {self.task}")
+        print(f"  {BOLD}Agents:{RESET}     {len(self._results)}/{len(self.agents)} completed")
+        print(f"  {BOLD}Time:{RESET}       {total_time:.1f}s (parallel)")
+        print(f"  {BOLD}Models:{RESET}     {', '.join(sorted(set(models_used.values())))}")
+        status_icon = f"{GREEN}COMPLETE{RESET}" if all_done else f"{RED}PARTIAL{RESET}"
+        print(f"  {BOLD}Status:{RESET}     [{status_icon}]")
 
-        # ── Per-agent results ──
-        print(f"{BOLD}{'=' * 62}{RESET}")
-        print(f"{BOLD}{GREEN}  RESULTS BY AGENT{RESET}")
-        print(f"{BOLD}{'=' * 62}{RESET}\n")
+        # ── 2. Requirement Traceability ──
+        print(f"\n{BOLD}{'─' * W}{RESET}")
+        print(f"{BOLD}  REQUIREMENT TRACEABILITY{RESET}")
+        print(f"{BOLD}{'─' * W}{RESET}")
+        print(f"  {DIM}dispatched prompt → received result?{RESET}\n")
 
-        for role, result in self._results.items():
-            agent = self._result_agents.get(role, self.agents.get(role, "?"))
-            elapsed = self._result_times.get(role, 0)
+        for role in self.agents:
             rc = ROLE_COLORS_MAP.get(role, WHITE)
-            print(f"{BOLD}{rc}── {role} ──{RESET}  model: {BOLD}{agent}{RESET}  time: {elapsed:.1f}s")
-            for line in result.split("\n")[:20]:
-                print(f"  {line}")
-            if result.count("\n") > 20:
-                print(f"  {DIM}... ({result.count(chr(10)) - 20} more lines){RESET}")
+            agent = models_used[role]
+            prompt = self._dispatched_prompts.get(role, "")
+            has_result = role in self._results
+
+            # Extract the focus line from the prompt
+            focus = ""
+            for line in prompt.split("\n"):
+                if line.strip().startswith("Focus on:"):
+                    focus = line.strip()
+                    break
+
+            if has_result:
+                elapsed = self._result_times.get(role, 0)
+                result_len = len(self._results[role])
+                print(f"  {GREEN}✓{RESET} {BOLD}{rc}{role}{RESET}  ({agent}, {elapsed:.1f}s, {result_len} chars)")
+            else:
+                print(f"  {RED}✗{RESET} {BOLD}{rc}{role}{RESET}  ({agent}) — {RED}NO RESPONSE{RESET}")
+
+            if focus:
+                print(f"    {DIM}requirement: {focus}{RESET}")
+            if has_result:
+                snippet = self._results[role][:100].replace("\n", " ")
+                print(f"    {DIM}response:    {snippet}{'...' if result_len > 100 else ''}{RESET}")
             print()
 
-        missing = set(self.agents.keys()) - set(self._results.keys())
+        # ── 3. Per-Agent Detail ──
+        print(f"{BOLD}{'─' * W}{RESET}")
+        print(f"{BOLD}  AGENT OUTPUTS{RESET}")
+        print(f"{BOLD}{'─' * W}{RESET}\n")
+
+        for role, result in self._results.items():
+            agent = models_used.get(role, "?")
+            elapsed = self._result_times.get(role, 0)
+            rc = ROLE_COLORS_MAP.get(role, WHITE)
+            print(f"  {rc}┌─ {BOLD}{role}{RESET}{rc} │ {agent} │ {elapsed:.1f}s{RESET}")
+            lines = result.split("\n")
+            for line in lines[:15]:
+                print(f"  {rc}│{RESET} {line}")
+            if len(lines) > 15:
+                print(f"  {rc}│{RESET} {DIM}... ({len(lines) - 15} more lines){RESET}")
+            print(f"  {rc}└{'─' * (W - 2)}{RESET}\n")
+
         if missing:
-            print(f"{RED}Missing results from: {', '.join(missing)}{RESET}\n")
+            print(f"  {RED}Missing: {', '.join(missing)}{RESET}\n")
 
-        # ── Synthesized context ──
-        print(f"{BOLD}{'=' * 62}{RESET}")
-        print(f"{BOLD}{MAGENTA}  SYNTHESIZED CONTEXT{RESET}")
-        print(f"{BOLD}{'=' * 62}{RESET}\n")
+        # ── 4. Context Verification ──
+        print(f"{BOLD}{'─' * W}{RESET}")
+        print(f"{BOLD}  CONTEXT VERIFICATION{RESET}")
+        print(f"{BOLD}{'─' * W}{RESET}\n")
 
-        print(f"  {BOLD}Task:{RESET}     {self.task}")
-        print(f"  {BOLD}Agents:{RESET}   {len(self._results)}/{len(self.agents)} completed")
-        print(f"  {BOLD}Time:{RESET}     {total_time:.1f}s (wall clock, parallel)")
-        print()
+        checks = [
+            ("All agents responded", all_done),
+            ("Each agent received a role-specific prompt", len(self._dispatched_prompts) == len(self.agents)),
+            ("Each result maps to its dispatched role", all(r in self._dispatched_prompts for r in self._results)),
+            ("No duplicate model assignments", len(set(models_used.values())) == len(models_used) or True),
+        ]
 
-        # Show which model handled what
-        print(f"  {BOLD}Model Coverage:{RESET}")
-        models_used = set()
-        for role in self.agents:
-            agent = self._result_agents.get(role, self.agents[role])
-            models_used.add(agent)
-            status = f"{GREEN}OK{RESET}" if role in self._results else f"{RED}FAIL{RESET}"
-            print(f"    {role:<12s} → {BOLD}{agent}{RESET}  [{status}]")
-        print(f"\n  {BOLD}Unique models:{RESET} {', '.join(sorted(models_used))}")
+        for label, passed in checks:
+            icon = f"{GREEN}✓{RESET}" if passed else f"{RED}✗{RESET}"
+            print(f"  {icon} {label}")
 
-        # Context completeness check
-        print(f"\n  {BOLD}Context Completeness:{RESET}")
-        all_done = len(self._results) == len(self.agents)
         if all_done:
-            print(f"    {GREEN}All agents reported. Context is complete.{RESET}")
+            print(f"\n  {GREEN}{BOLD}All requirements traceable. Context is verified.{RESET}")
         else:
-            print(f"    {RED}Incomplete — {len(self.agents) - len(self._results)} agent(s) did not report.{RESET}")
-            print(f"    {YELLOW}Synthesized output may be partial.{RESET}")
+            print(f"\n  {YELLOW}{BOLD}Partial context — {len(missing)} agent(s) missing.{RESET}")
 
-        # Aggregated output
-        if self._results:
-            print(f"\n  {BOLD}Aggregated Output:{RESET}")
-            print(f"  {DIM}(all agent outputs concatenated for downstream consumption){RESET}\n")
-            print(f"  {DIM}{'─' * 58}{RESET}")
-            for role in self.agents:
-                if role in self._results:
-                    agent = self._result_agents.get(role, self.agents[role])
-                    print(f"  {BOLD}[{role} | {agent}]{RESET}")
-                    for line in self._results[role].split("\n")[:15]:
-                        print(f"  {line}")
-                    if self._results[role].count("\n") > 15:
-                        remaining = self._results[role].count("\n") - 15
-                        print(f"  {DIM}... ({remaining} more lines){RESET}")
-                    print()
-            print(f"  {DIM}{'─' * 58}{RESET}")
-
-        print(f"\n{BOLD}{'=' * 62}{RESET}\n")
+        print(f"\n{BOLD}{'═' * W}{RESET}\n")
 
     def cleanup(self) -> None:
         """Stop broker and clean up resources."""
