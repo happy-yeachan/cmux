@@ -168,36 +168,80 @@ def _run_with_pty(cmd: list[str], cwd: str, timeout: float = 300,
 AGENT_TIMEOUT = int(os.environ.get("CMUX_ORCHESTRATE_TIMEOUT", "600"))
 
 
-async def run_agent_cli(role: str, agent: str, task_payload: str) -> str:
-    """Run a real agent CLI in headless mode and capture output.
+def _run_interactive(cmd: list[str], cwd: str, capture_file: str,
+                     timeout: float = 600) -> tuple[int, str]:
+    """Run a command interactively in the real terminal, capturing output via `script`.
 
-    All agents are executed via pseudo-TTY to satisfy isatty() checks
-    (required by codex, beneficial for others).
+    Used for agents like codex that require a real TTY and don't support
+    headless mode. The agent runs visibly in the pane while `script`
+    records all output to a file.
     """
-    # Build the CLI command and stdin mode per agent:
-    #   claude-code:  claude --print --output-format text "<prompt>"  (positional arg, stdin=DEVNULL)
-    #   codex:        codex "<prompt>"                               (positional arg, stdin=PTY)
-    #   gemini-cli:   gemini --prompt "<prompt>"                     (--prompt flag, stdin=DEVNULL)
-    stdin_tty = False
+    # macOS script: script -q <file> <command> [args...]
+    script_cmd = ["script", "-q", capture_file] + cmd
+    proc = subprocess.Popen(script_cmd, cwd=cwd)
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise TimeoutError(f"Process timed out after {timeout}s")
+
+    # Read captured output
+    try:
+        raw = Path(capture_file).read_text(errors="replace")
+    except FileNotFoundError:
+        raw = ""
+    finally:
+        Path(capture_file).unlink(missing_ok=True)
+
+    # Strip ANSI escape sequences
+    import re
+    text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", raw)
+    text = re.sub(r"\x1b\].*?\x07", "", text)
+    text = re.sub(r"\r", "", text)
+    return proc.returncode, text.strip()
+
+
+async def run_agent_cli(role: str, agent: str, task_payload: str) -> str:
+    """Run a real agent CLI and capture output.
+
+    Execution mode per agent:
+      - claude-code:  headless (--print), output via PTY capture
+      - gemini-cli:   headless (--prompt), output via PTY capture
+      - codex:        interactive in pane, output via `script` capture
+    """
+    timeout = AGENT_TIMEOUT
+    cwd = os.environ.get("CMUX_ORCHESTRATE_CWD", os.getcwd())
+
     if agent == "claude-code":
         cmd = ["claude", "--print", "--output-format", "text", task_payload]
+        mode = "headless"
     elif agent == "codex":
         cmd = ["codex", task_payload]
-        stdin_tty = True  # codex requires isatty(stdin)
+        mode = "interactive"
     elif agent == "gemini-cli":
         cmd = ["gemini", "--prompt", task_payload]
+        mode = "headless"
     else:
         return await run_agent_mock(role, task_payload)
 
-    timeout = AGENT_TIMEOUT
-    log(role, f"executing: {cmd[0]} {' '.join(cmd[1:3])}... (timeout: {timeout}s)", YELLOW)
-    cwd = os.environ.get("CMUX_ORCHESTRATE_CWD", os.getcwd())
+    log(role, f"executing ({mode}): {cmd[0]} ... (timeout: {timeout}s)", YELLOW)
 
     try:
-        returncode, output = await asyncio.wait_for(
-            asyncio.to_thread(_run_with_pty, cmd, cwd, timeout, stdin_tty),
-            timeout=timeout + 10,
-        )
+        if mode == "interactive":
+            # Run in real terminal with script capture
+            capture_file = f"/tmp/cmux-orchestrate-{role}-{os.getpid()}.log"
+            returncode, output = await asyncio.wait_for(
+                asyncio.to_thread(_run_interactive, cmd, cwd, capture_file, timeout),
+                timeout=timeout + 10,
+            )
+        else:
+            # Headless via PTY (stdin=DEVNULL)
+            returncode, output = await asyncio.wait_for(
+                asyncio.to_thread(_run_with_pty, cmd, cwd, timeout, False),
+                timeout=timeout + 10,
+            )
 
         if returncode != 0:
             log(role, f"agent exited with code {returncode}", RED)
