@@ -7,19 +7,22 @@ cmux split panes, coordinates them via an IPC broker, and collects
 results.
 
 Usage:
+    # Auto mode: detect agents and assign roles automatically
+    cmux-orchestrate --task "Build a login page"
+
+    # Manual override
     cmux-orchestrate --task "Build a login page" \\
         --agents frontend=claude-code,backend=codex,review=gemini-cli
 
+    # Mock mode (testing)
     cmux-orchestrate --task "Refactor auth module" --mock
-
-    cmux-orchestrate --task "Add unit tests" \\
-        --agents tests=claude-code,review=gemini-cli
 """
 
 import argparse
 import asyncio
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -49,6 +52,170 @@ DEFAULT_MOCK_AGENTS = {
     "backend": "mock",
     "review": "mock",
 }
+
+# ── Agent registry: known CLI agents and their capabilities ──────────
+
+AGENT_REGISTRY: list[dict] = [
+    {
+        "name": "claude-code",
+        "commands": ["claude"],           # binary names to check
+        "strengths": ["frontend", "fullstack", "refactor", "debug", "docs", "test"],
+        "description": "Strong at UI, architecture, full-stack reasoning",
+        "priority": 1,                    # lower = preferred when tied
+    },
+    {
+        "name": "codex",
+        "commands": ["codex"],
+        "strengths": ["backend", "logic", "algorithm", "api", "database", "test"],
+        "description": "Strong at backend logic, algorithms, API design",
+        "priority": 2,
+    },
+    {
+        "name": "gemini-cli",
+        "commands": ["gemini"],
+        "strengths": ["review", "analysis", "security", "docs", "test"],
+        "description": "Strong at code review, analysis, documentation",
+        "priority": 3,
+    },
+]
+
+# Task keywords → roles mapping
+ROLE_KEYWORDS: dict[str, list[str]] = {
+    "frontend": ["ui", "frontend", "component", "page", "layout", "css", "style",
+                  "react", "vue", "svelte", "html", "form", "button", "dashboard",
+                  "responsive", "animation", "ux"],
+    "backend":  ["api", "backend", "server", "database", "endpoint", "auth",
+                  "rest", "graphql", "middleware", "model", "schema", "migration",
+                  "queue", "cache", "oauth", "login", "session"],
+    "review":   ["review", "audit", "security", "performance", "test", "quality",
+                  "refactor", "lint", "fix", "bug", "optimize"],
+    "test":     ["test", "spec", "coverage", "e2e", "unit test", "integration"],
+    "docs":     ["document", "readme", "changelog", "comment", "jsdoc", "docstring"],
+    "devops":   ["deploy", "ci", "cd", "docker", "kubernetes", "terraform", "infra"],
+}
+
+
+def detect_available_agents() -> list[dict]:
+    """Detect which agent CLIs are installed on the system."""
+    available = []
+    for agent in AGENT_REGISTRY:
+        for cmd in agent["commands"]:
+            if shutil.which(cmd):
+                available.append(agent)
+                break
+    return available
+
+
+def analyze_task_roles(task: str) -> list[str]:
+    """Analyze a task description and determine which roles are needed."""
+    task_lower = task.lower()
+    role_scores: dict[str, int] = {}
+
+    for role, keywords in ROLE_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in task_lower)
+        if score > 0:
+            role_scores[role] = score
+
+    # Always include review if we have 2+ other roles
+    if not role_scores:
+        # Generic task: default to frontend + backend + review
+        return ["frontend", "backend", "review"]
+
+    roles = sorted(role_scores, key=lambda r: role_scores[r], reverse=True)
+
+    # Cap at 4 roles max, ensure review is included for quality
+    if "review" not in roles:
+        roles.append("review")
+    return roles[:4]
+
+
+def assign_agents(roles: list[str], available: list[dict]) -> dict[str, str]:
+    """Assign the best available agent to each role."""
+    if not available:
+        # No agents found — fall back to mock
+        return {role: "mock" for role in roles}
+
+    assignments: dict[str, str] = {}
+    used_agents: set[str] = set()
+
+    for role in roles:
+        best_agent = None
+        best_score = -1
+
+        for agent in available:
+            # Score: how many of this agent's strengths match the role
+            score = 10 if role in agent["strengths"] else 0
+            # Prefer agents not yet assigned (diversity)
+            if agent["name"] not in used_agents:
+                score += 5
+            # Priority tiebreaker (lower = better)
+            score -= agent["priority"]
+
+            if score > best_score:
+                best_score = score
+                best_agent = agent
+
+        if best_agent:
+            assignments[role] = best_agent["name"]
+            used_agents.add(best_agent["name"])
+
+    return assignments
+
+
+def auto_plan(task: str) -> dict[str, str]:
+    """Full auto: detect agents, analyze task, assign roles."""
+    available = detect_available_agents()
+    roles = analyze_task_roles(task)
+    assignments = assign_agents(roles, available)
+    return assignments
+
+
+def print_auto_plan(task: str, available: list[dict], roles: list[str], assignments: dict[str, str]) -> None:
+    """Print the auto-planning decision."""
+    W = 62
+    print(f"\n{DIM}{'─' * W}{RESET}")
+    print(f"{BOLD}{CYAN}  AUTO-PLAN{RESET}")
+    print(f"{DIM}{'─' * W}{RESET}")
+
+    # Available agents
+    print(f"\n  {BOLD}Detected agents:{RESET}")
+    if available:
+        for agent in available:
+            print(f"    {GREEN}✓{RESET} {BOLD}{agent['name']}{RESET}  {DIM}— {agent['description']}{RESET}")
+    else:
+        print(f"    {YELLOW}(none found — using mock){RESET}")
+
+    not_found = [a for a in AGENT_REGISTRY if a not in available]
+    for agent in not_found:
+        cmds = ", ".join(agent["commands"])
+        print(f"    {RED}✗{RESET} {DIM}{agent['name']}  ('{cmds}' not in PATH){RESET}")
+
+    # Task analysis
+    print(f"\n  {BOLD}Task analysis:{RESET}")
+    print(f"    \"{task}\"")
+    task_lower = task.lower()
+    matched_keywords: dict[str, list[str]] = {}
+    for role, keywords in ROLE_KEYWORDS.items():
+        hits = [kw for kw in keywords if kw in task_lower]
+        if hits:
+            matched_keywords[role] = hits
+    if matched_keywords:
+        for role, hits in matched_keywords.items():
+            print(f"    {DIM}→ {role}: matched [{', '.join(hits)}]{RESET}")
+    else:
+        print(f"    {DIM}→ no specific keywords matched, using default roles{RESET}")
+
+    # Assignments
+    print(f"\n  {BOLD}Role → Agent assignments:{RESET}")
+    for role, agent in assignments.items():
+        reason = ""
+        for a in AGENT_REGISTRY:
+            if a["name"] == agent and role in a["strengths"]:
+                reason = f"  {DIM}(strength match){RESET}"
+                break
+        print(f"    {BOLD}{role:<12s}{RESET} → {BOLD}{agent}{RESET}{reason}")
+
+    print(f"\n{DIM}{'─' * W}{RESET}\n")
 
 
 def log(msg: str, color: str = DIM) -> None:
@@ -575,8 +742,17 @@ def parse_agents(agents_str: str) -> dict[str, str]:
 async def run(args: argparse.Namespace) -> None:
     if args.mock:
         agents = DEFAULT_MOCK_AGENTS
-    else:
+        log("mode: mock", DIM)
+    elif args.agents:
         agents = parse_agents(args.agents)
+        log("mode: manual assignment", DIM)
+    else:
+        # ── Auto mode: detect, analyze, assign ──
+        log("mode: auto-plan", CYAN)
+        available = detect_available_agents()
+        roles = analyze_task_roles(args.task)
+        agents = assign_agents(roles, available)
+        print_auto_plan(args.task, available, roles, agents)
 
     session = OrchestrateSession(
         task=args.task,
@@ -615,16 +791,15 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Mock mode (no real agents, great for testing)
-  cmux-orchestrate --task "Build a dashboard" --mock
+  # Auto mode: detect installed agents, assign roles automatically
+  cmux-orchestrate --task "Build a login page with OAuth"
 
-  # Real agents
-  cmux-orchestrate --task "Build a login page" \\
+  # Manual override
+  cmux-orchestrate --task "Build a dashboard" \\
       --agents frontend=claude-code,backend=codex,review=gemini-cli
 
-  # Two agents only
-  cmux-orchestrate --task "Add unit tests" \\
-      --agents tests=claude-code,review=gemini-cli
+  # Mock mode (testing/demo)
+  cmux-orchestrate --task "Build a dashboard" --mock
         """,
     )
     parser.add_argument(
@@ -651,8 +826,7 @@ Examples:
 
     args = parser.parse_args()
 
-    if not args.mock and not args.agents:
-        parser.error("Either --agents or --mock is required")
+    # No error if neither --agents nor --mock: auto mode kicks in
 
     if args.socket:
         global SOCKET_PATH
@@ -660,7 +834,12 @@ Examples:
 
     banner()
     log(f"task: {args.task}", WHITE)
-    log(f"agents: {args.agents if args.agents else 'mock (frontend, backend, review)'}", WHITE)
+    if args.mock:
+        log(f"agents: mock (frontend, backend, review)", WHITE)
+    elif args.agents:
+        log(f"agents: {args.agents}", WHITE)
+    else:
+        log(f"agents: auto-detect", CYAN)
     log(f"cwd: {args.cwd or os.getcwd()}", DIM)
     print()
 
