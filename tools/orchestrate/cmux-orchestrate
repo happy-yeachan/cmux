@@ -93,20 +93,27 @@ def cmux_split(direction: str = "right") -> str:
     output = cmux("new-split", direction, json_output=True)
     try:
         data = json.loads(output)
-        # Try various key names the API might return
+        # The v2 response may be wrapped in a "result" key
+        if "result" in data and isinstance(data["result"], dict):
+            data = data["result"]
+        # surface.split returns surface_ref (refs mode) or surface_id (uuids mode)
         surface_id = (
-            data.get("created_surface_ref")
+            data.get("surface_ref")
+            or data.get("surface_id")
+            or data.get("created_surface_ref")
             or data.get("created_surface_id")
             or data.get("created_tab_ref")
             or data.get("created_tab_id")
-            or data.get("surface_id")
             or ""
         )
+        if not surface_id:
+            log(f"  [debug] split response keys: {list(data.keys())}", DIM)
         return surface_id
     except json.JSONDecodeError:
         # Fallback: parse "OK surface:N" format
         if output.startswith("OK "):
             return output.split()[-1]
+        log(f"  [debug] raw split output: {output[:200]}", DIM)
         return ""
 
 
@@ -176,15 +183,35 @@ class OrchestrateSession:
             # Alternate split directions for a nice layout
             direction = "right" if i % 2 == 0 else "down"
             try:
+                # Snapshot panes before split so we can diff
+                before = {self._pane_surface(p) for p in cmux_list_panes()}
                 surface = cmux_split(direction)
+
+                # Fallback: diff pane lists to find the new surface
+                if not surface:
+                    time.sleep(0.3)
+                    after = {self._pane_surface(p) for p in cmux_list_panes()}
+                    new_surfaces = after - before
+                    if new_surfaces:
+                        surface = new_surfaces.pop()
+                        log(f"  (resolved via pane diff)", DIM)
+
                 self.surface_ids[role] = surface
-                log(f"  pane for '{role}' → {surface or '(default)'}", GREEN)
-                # Small delay for cmux to settle
+                log(f"  pane for '{role}' → {surface or '(FAILED)'}", GREEN if surface else RED)
                 time.sleep(0.3)
             except RuntimeError as e:
                 log(f"  failed to create pane for '{role}': {e}", RED)
-                # Fall back: run in current pane without split
                 self.surface_ids[role] = ""
+
+    @staticmethod
+    def _pane_surface(pane: dict) -> str:
+        """Extract surface ref/id from a pane dict."""
+        # pane.list returns surfaces as nested list or direct fields
+        surfaces = pane.get("surfaces", [])
+        if surfaces and isinstance(surfaces, list):
+            s = surfaces[0] if surfaces else {}
+            return s.get("ref") or s.get("id") or ""
+        return pane.get("surface_ref") or pane.get("surface_id") or pane.get("ref") or pane.get("id") or ""
 
     def launch_workers(self) -> None:
         """Send worker launch commands into each pane."""
