@@ -864,16 +864,24 @@ class OrchestrateSession:
                     )
             return prompts
 
-        # Fallback: static templates
+        # Fallback: static templates with directive instructions
         prompts: dict[str, str] = {}
+        directive = (
+            "IMPORTANT: Do NOT ask clarifying questions. Use sensible defaults "
+            "and start building immediately. Create real files in the current "
+            "working directory. Pick a reasonable tech stack and implement."
+        )
         templates = {
-            "frontend": "You are the frontend specialist. For the following task, implement the UI/frontend parts:\n\nTask: {task}\n\nFocus on: components, layout, styling, user interactions.",
-            "backend": "You are the backend specialist. For the following task, implement the backend/logic parts:\n\nTask: {task}\n\nFocus on: API endpoints, data models, business logic, database.",
-            "review": "You are the code reviewer. Review the work done for the following task:\n\nTask: {task}\n\nFocus on: correctness, security, performance, best practices.",
+            "frontend": f"You are the frontend specialist. Implement the UI/frontend parts of this task.\n\nTask: {{task}}\n\nFocus on: components, layout, styling, user interactions.\n\n{directive}",
+            "backend": f"You are the backend specialist. Implement the backend/logic parts of this task.\n\nTask: {{task}}\n\nFocus on: API endpoints, data models, business logic, database.\n\n{directive}",
+            "review": "You are the code reviewer. Review ALL files in the current working directory for the following task:\n\nTask: {task}\n\nFocus on: correctness, security, performance, best practices. List specific issues found.",
+            "test": f"You are the test engineer. Write tests for this task.\n\nTask: {{task}}\n\nFocus on: unit tests, edge cases, coverage.\n\n{directive}",
+            "docs": f"You are the documentation specialist. Write documentation for this task.\n\nTask: {{task}}\n\nFocus on: README, API docs, setup instructions.\n\n{directive}",
+            "devops": f"You are the DevOps specialist. Set up infrastructure for this task.\n\nTask: {{task}}\n\nFocus on: Dockerfile, CI/CD, deployment config.\n\n{directive}",
         }
 
         for role in self.agents:
-            template = templates.get(role, "You are the {role} specialist. Handle the {role}-related parts of this task:\n\nTask: {task}")
+            template = templates.get(role, f"You are the {{role}} specialist. Handle the {{role}}-related parts of this task.\n\nTask: {{task}}\n\n{directive}")
             prompts[role] = template.format(task=self.task, role=role)
 
         return prompts
@@ -1125,11 +1133,27 @@ async def run(args: argparse.Namespace) -> None:
 
             print(f"\n{DIM}{'─' * W}{RESET}\n")
         else:
-            # Fallback to keyword-based planning
+            # Fallback to keyword-based planning with proper phasing
             log("mode: keyword auto-plan (AI unavailable)", YELLOW)
             roles = analyze_task_roles(args.task)
             agents = assign_agents(roles, available)
             print_auto_plan(args.task, available, roles, agents)
+
+            # Build phased plan: implement tasks first, then review
+            impl_roles = {r: a for r, a in agents.items() if r != "review"}
+            review_roles = {r: a for r, a in agents.items() if r == "review"}
+
+            phases = []
+            if impl_roles:
+                phases.append({
+                    "name": "implement",
+                    "tasks": [{"role": r, "agent": a, "prompt": ""} for r, a in impl_roles.items()],
+                })
+            if review_roles:
+                phases.append({
+                    "name": "review",
+                    "tasks": [{"role": r, "agent": a, "prompt": ""} for r, a in review_roles.items()],
+                })
 
     session = OrchestrateSession(
         task=args.task,
