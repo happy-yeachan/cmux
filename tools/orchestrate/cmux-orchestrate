@@ -57,15 +57,37 @@ DEFAULT_MOCK_AGENTS = {
     "review": "mock",
 }
 
-# ── Agent registry: loaded from agents.json ──────────────────────────
+# ── Agent registry ───────────────────────────────────────────────────
+# agents.json contains just a list of names: ["claude-code", "codex", "gemini-cli"]
+# Internal knowledge maps names → command, description, strengths for
+# auto-planning. The AI planner can override these assignments.
 
-def _load_agent_registry() -> list[dict]:
-    """Load agent registry from agents.json.
+AGENT_KNOWLEDGE = {
+    "claude-code": {
+        "commands": ["claude"],
+        "description": "Strong at UI, architecture, full-stack reasoning",
+        "strengths": ["frontend", "fullstack", "refactor", "debug", "docs", "test"],
+        "priority": 1,
+    },
+    "codex": {
+        "commands": ["codex"],
+        "description": "Strong at backend logic, algorithms, API design",
+        "strengths": ["backend", "logic", "algorithm", "api", "database", "test"],
+        "priority": 2,
+    },
+    "gemini-cli": {
+        "commands": ["gemini"],
+        "description": "Strong at code review, analysis, documentation",
+        "strengths": ["review", "analysis", "security", "docs", "test"],
+        "priority": 3,
+    },
+}
 
-    Search order:
-      1. CMUX_ORCHESTRATE_AGENTS env var
-      2. ./agents.json (next to this script)
-      3. ~/.config/cmux-orchestrate/agents.json
+
+def _load_agent_names() -> list[str]:
+    """Load available agent names from agents.json.
+
+    agents.json is just a JSON array of strings: ["claude-code", "codex", ...]
     """
     config_paths = [
         Path(os.environ.get("CMUX_ORCHESTRATE_AGENTS", "")),
@@ -76,26 +98,31 @@ def _load_agent_registry() -> list[dict]:
         if p.is_file():
             try:
                 data = json.loads(p.read_text())
-                agents = data.get("agents", [])
-                # Normalize: add "commands" field from "command"
-                for a in agents:
-                    if "commands" not in a:
-                        a["commands"] = [a["command"]] if "command" in a else []
-                log(f"loaded {len(agents)} agents from {p}", DIM)
-                return agents
-            except (json.JSONDecodeError, OSError) as e:
-                log(f"failed to load {p}: {e}", RED)
+                if isinstance(data, list):
+                    log(f"agents.json: {data}", DIM)
+                    return data
+            except (json.JSONDecodeError, OSError):
+                continue
     return []
 
 
-# Lazy-loaded on first access
 _AGENT_REGISTRY: list[dict] | None = None
 
 
 def get_agent_registry() -> list[dict]:
+    """Build registry from agents.json names + internal knowledge."""
     global _AGENT_REGISTRY
     if _AGENT_REGISTRY is None:
-        _AGENT_REGISTRY = _load_agent_registry()
+        names = _load_agent_names()
+        _AGENT_REGISTRY = []
+        for name in names:
+            info = AGENT_KNOWLEDGE.get(name, {
+                "commands": [name],
+                "description": f"Agent: {name}",
+                "strengths": [],
+                "priority": 99,
+            })
+            _AGENT_REGISTRY.append({"name": name, **info})
     return _AGENT_REGISTRY
 
 # Task keywords → roles mapping
@@ -345,15 +372,13 @@ def ai_plan_task(task: str, available_agents: list[dict]) -> dict | None:
       }
     Or None if AI planning fails.
     """
-    agent_descriptions = "\n".join(
-        f"  - {a['name']}: {a['description']} (strengths: {', '.join(a['strengths'])})"
-        for a in available_agents
-    )
+    agent_names = [a["name"] for a in available_agents]
 
     prompt = f"""You are the orchestrator for a multi-agent coding system.
 
-AVAILABLE AGENTS:
-{agent_descriptions}
+AVAILABLE AGENTS: {", ".join(agent_names)}
+
+You know each agent's capabilities. Assign the best agent for each sub-task.
 
 TASK:
 {task}

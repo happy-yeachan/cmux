@@ -66,25 +66,28 @@ SNAPSHOT_INTERVAL = 30
 _CURRENT_AGENT: str = ""
 
 
-# ── Agent config from JSON ──────────────���────────────────────────────
+# ── Agent execution config (internal knowledge) ─────────────────────
+# How to run each agent CLI. Users don't need to know this —
+# they just list available agent names in agents.json.
 
-def load_agent_config(agent_name: str) -> dict | None:
-    """Load agent execution config from agents.json."""
-    config_paths = [
-        Path(os.environ.get("CMUX_ORCHESTRATE_AGENTS", "")),
-        SCRIPT_DIR / "agents.json",
-        Path.home() / ".config" / "cmux-orchestrate" / "agents.json",
-    ]
-    for p in config_paths:
-        if p.is_file():
-            try:
-                data = json.loads(p.read_text())
-                for agent in data.get("agents", []):
-                    if agent.get("name") == agent_name:
-                        return agent
-            except (json.JSONDecodeError, OSError):
-                continue
-    return None
+AGENT_EXEC_CONFIG = {
+    "claude-code": {
+        "command": "claude",
+        "mode": "stdin",       # prompt piped via stdin → interactive TUI
+        "args": ["--dangerously-skip-permissions"],
+    },
+    "codex": {
+        "command": "codex",
+        "mode": "positional",  # prompt as positional arg
+        "args": [],
+    },
+    "gemini-cli": {
+        "command": "gemini",
+        "mode": "flag",        # prompt via -p flag
+        "prompt_flag": "-p",
+        "args": ["-y"],
+    },
+}
 
 
 def log(role: str, msg: str, color: str = "") -> None:
@@ -220,44 +223,30 @@ def _run_interactive(cmd: list[str], cwd: str, capture_file: str,
 
 
 def _build_agent_cmd(agent: str, task_payload: str) -> tuple[list[str], str | None]:
-    """Build command and stdin_text from agents.json config.
+    """Build command and stdin_text from internal exec config.
 
     Returns (cmd, stdin_text). stdin_text is None for positional/flag modes.
 
-    Execution modes (from agents.json):
+    Execution modes:
       - "stdin":      prompt piped via stdin, agent shows interactive TUI
       - "positional": prompt as last CLI argument
       - "flag":       prompt via a flag (e.g. -p "prompt")
     """
-    config = load_agent_config(agent)
-
-    if config:
-        exe = config["command"]
-        exec_cfg = config.get("execution", {})
-        mode = exec_cfg.get("mode", "positional")
-        extra_args = exec_cfg.get("args", [])
-        prompt_flag = exec_cfg.get("prompt_flag", "")
-
-        if mode == "stdin":
-            # Prompt piped via stdin → agent runs interactive TUI, exits on EOF
-            cmd = [exe] + extra_args
-            return cmd, task_payload
-        elif mode == "flag":
-            cmd = [exe] + extra_args + [prompt_flag, task_payload] if prompt_flag else [exe] + extra_args + [task_payload]
-            return cmd, None
-        else:  # positional
-            cmd = [exe] + extra_args + [task_payload]
-            return cmd, None
-
-    # Fallback: hardcoded defaults if agent not in JSON
-    if agent == "claude-code":
-        return ["claude", "--dangerously-skip-permissions"], task_payload
-    elif agent == "codex":
-        return ["codex", task_payload], None
-    elif agent == "gemini-cli":
-        return ["gemini", "-p", task_payload, "-y"], None
-    else:
+    config = AGENT_EXEC_CONFIG.get(agent)
+    if not config:
         return [], None
+
+    exe = config["command"]
+    mode = config.get("mode", "positional")
+    extra_args = config.get("args", [])
+    prompt_flag = config.get("prompt_flag", "")
+
+    if mode == "stdin":
+        return [exe] + extra_args, task_payload
+    elif mode == "flag" and prompt_flag:
+        return [exe] + extra_args + [prompt_flag, task_payload], None
+    else:  # positional
+        return [exe] + extra_args + [task_payload], None
 
 
 async def run_agent_cli(role: str, agent: str, task_payload: str, cwd: str,
