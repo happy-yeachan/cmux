@@ -307,14 +307,24 @@ def _extract_json(text: str) -> dict | None:
 
 
 def ai_plan_task(task: str, available_agents: list[dict]) -> dict | None:
-    """Use claude as main agent to decompose task into roles + prompts.
+    """Use claude as main agent to decompose task into phased plan.
 
     Returns dict like:
       {
-        "roles": [
-          {"role": "frontend", "agent": "claude-code", "prompt": "..."},
-          {"role": "backend", "agent": "codex", "prompt": "..."},
-          ...
+        "phases": [
+          {
+            "name": "implement",
+            "tasks": [
+              {"role": "backend-auth", "agent": "codex", "prompt": "..."},
+              {"role": "frontend", "agent": "claude-code", "prompt": "..."}
+            ]
+          },
+          {
+            "name": "review",
+            "tasks": [
+              {"role": "review", "agent": "gemini-cli", "prompt": "..."}
+            ]
+          }
         ]
       }
     Or None if AI planning fails.
@@ -332,18 +342,18 @@ AVAILABLE AGENTS:
 TASK:
 {task}
 
-Analyze this task and decompose it. For each sub-task, assign the best-fit agent and write a specific, detailed prompt.
+Decompose this task into PHASES. Within each phase, tasks run in parallel. Phases run sequentially — later phases can depend on earlier phase results.
 
 Rules:
-- Choose only from the available agents listed above.
-- Each role name should be a short lowercase word (e.g., frontend, backend, review, test, devops, docs).
-- Always include a "review" role that will review the other agents' outputs.
+- Choose only from the available agents listed above. You may assign the same agent to multiple tasks.
+- Each role name should be a short, unique lowercase identifier (e.g., backend-auth, backend-db, frontend-ui, review).
+- The last phase should always be "review" — it reviews all prior phase outputs.
 - Write prompts that are specific to THIS task, not generic templates.
-- The review agent's prompt should reference what the other agents are doing.
-- Max 4 roles.
+- Review prompts should reference what the earlier phases are doing.
+- Max 6 tasks total across all phases.
 
 Respond with ONLY a JSON object (no markdown, no explanation):
-{{"roles": [{{"role": "...", "agent": "...", "prompt": "..."}}]}}"""
+{{"phases": [{{"name": "...", "tasks": [{{"role": "...", "agent": "...", "prompt": "..."}}]}}]}}"""
 
     log("main agent (claude) analyzing task...", CYAN)
     start = time.time()
@@ -356,10 +366,20 @@ Respond with ONLY a JSON object (no markdown, no explanation):
 
     log(f"main agent responded ({elapsed:.1f}s)", GREEN)
     parsed = _extract_json(result)
-    if not parsed or "roles" not in parsed:
-        log(f"main agent returned invalid JSON — falling back", RED)
-        log(f"  raw: {result[:200]}", DIM)
-        return None
+    if not parsed or "phases" not in parsed:
+        # Try legacy "roles" format and auto-wrap in phases
+        if parsed and "roles" in parsed:
+            impl_tasks = [t for t in parsed["roles"] if t.get("role") != "review"]
+            review_tasks = [t for t in parsed["roles"] if t.get("role") == "review"]
+            parsed = {"phases": []}
+            if impl_tasks:
+                parsed["phases"].append({"name": "implement", "tasks": impl_tasks})
+            if review_tasks:
+                parsed["phases"].append({"name": "review", "tasks": review_tasks})
+        else:
+            log(f"main agent returned invalid JSON — falling back", RED)
+            log(f"  raw: {result[:200]}", DIM)
+            return None
 
     return parsed
 
@@ -477,6 +497,14 @@ def cmux_send(text: str, surface: str | None = None) -> None:
     cmux(*args)
 
 
+def cmux_close_surface(surface: str) -> None:
+    """Close a cmux surface/pane."""
+    try:
+        cmux("close-surface", "--surface", surface)
+    except RuntimeError:
+        pass  # Already closed or invalid
+
+
 def cmux_list_panes() -> list[dict]:
     """List current panes."""
     output = cmux("list-panes", json_output=True)
@@ -508,6 +536,7 @@ class OrchestrateSession:
         self._dispatch_time: float = 0.0
         self._ai_prompts: dict[str, str] = {}  # AI-generated prompts (if available)
         self._synthesis: str | None = None  # AI synthesis of results
+        self._phases: list[dict] | None = None  # phased execution plan
 
     def start_broker(self) -> None:
         """Launch the IPC broker as a background process."""
@@ -608,8 +637,73 @@ class OrchestrateSession:
             except RuntimeError as e:
                 log(f"  failed to launch worker '{role}': {e}", RED)
 
-    async def connect_and_dispatch(self) -> None:
-        """Connect to broker as orchestrator and dispatch tasks."""
+    def _create_phase_panes(self, phase_tasks: list[dict]) -> None:
+        """Create split panes for a single phase's tasks."""
+        roles = [t["role"] for t in phase_tasks]
+        log(f"creating {len(roles)} panes: {', '.join(roles)}", CYAN)
+
+        last_surface: str | None = None
+        for i, task_entry in enumerate(phase_tasks):
+            role = task_entry["role"]
+            try:
+                before = {self._pane_surface(p) for p in cmux_list_panes()}
+                if i == 0:
+                    surface = cmux_split("right")
+                else:
+                    surface = cmux_split("down", surface=last_surface)
+
+                if not surface:
+                    time.sleep(0.3)
+                    after = {self._pane_surface(p) for p in cmux_list_panes()}
+                    new_surfaces = after - before
+                    if new_surfaces:
+                        surface = new_surfaces.pop()
+
+                self.surface_ids[role] = surface
+                if surface:
+                    last_surface = surface
+                log(f"  {role} → {surface or '(FAILED)'}", GREEN if surface else RED)
+                time.sleep(0.3)
+            except RuntimeError as e:
+                log(f"  failed: {role}: {e}", RED)
+                self.surface_ids[role] = ""
+
+    def _launch_phase_workers(self, phase_tasks: list[dict]) -> None:
+        """Launch agent workers for a single phase."""
+        worker_script = str(SCRIPT_DIR / "agent_worker.py")
+        for task_entry in phase_tasks:
+            role = task_entry["role"]
+            agent_cli = task_entry["agent"]
+            surface = self.surface_ids.get(role)
+            cmd = (
+                f"python3 {worker_script} "
+                f"--role {role} "
+                f"--agent {agent_cli} "
+                f"--socket {SOCKET_PATH}"
+            )
+            log(f"  [{role}] {agent_cli} �� {surface or 'current'}", GREEN)
+            try:
+                cmux_send(cmd, surface=surface if surface else None)
+            except RuntimeError as e:
+                log(f"  failed to launch '{role}': {e}", RED)
+
+    def _close_phase_panes(self, phase_tasks: list[dict]) -> None:
+        """Close panes for completed phase tasks."""
+        for task_entry in phase_tasks:
+            role = task_entry["role"]
+            surface = self.surface_ids.get(role)
+            if surface:
+                log(f"  closing {role} ({surface})", DIM)
+                cmux_close_surface(surface)
+                del self.surface_ids[role]
+
+    async def run_phased(self) -> None:
+        """Execute phases sequentially, tasks within each phase in parallel."""
+        phases = self._phases or [{"name": "run", "tasks": [
+            {"role": r, "agent": a, "prompt": self._ai_prompts.get(r, "")}
+            for r, a in self.agents.items()
+        ]}]
+
         # Connect to broker
         for attempt in range(15):
             try:
@@ -620,91 +714,132 @@ class OrchestrateSession:
         else:
             raise ConnectionError("Could not connect to broker")
 
-        # Register as orchestrator
         writer.write(
             (json.dumps({"type": "register", "role": "orchestrator"}) + "\n").encode()
         )
         await writer.drain()
-        resp_line = await reader.readline()
+        await reader.readline()
         log("connected to broker as orchestrator", GREEN)
 
-        # Wait for all agent roles to register
-        roles = list(self.agents.keys())
-        log(f"waiting for agents to register: {', '.join(roles)}...", YELLOW)
-        writer.write(
-            (json.dumps({"type": "wait_ready", "roles": roles}) + "\n").encode()
-        )
-        await writer.drain()
+        total_phases = len(phases)
 
-        # Wait for ready response (with timeout)
-        try:
-            ready_line = await asyncio.wait_for(reader.readline(), timeout=30)
-            ready_msg = json.loads(ready_line.decode().strip())
-            if ready_msg.get("type") == "ready":
-                log("all agents ready!", GREEN)
-        except asyncio.TimeoutError:
-            log("timeout waiting for agents — proceeding anyway", YELLOW)
+        for phase_idx, phase in enumerate(phases):
+            phase_name = phase.get("name", f"phase-{phase_idx + 1}")
+            phase_tasks = phase.get("tasks", [])
+            if not phase_tasks:
+                continue
 
-        # ── Context Board: show agent assignments ─────────────
-        self._print_context_board("DISPATCH")
+            W = 62
+            print(f"\n{BOLD}{CYAN}{'━' * W}{RESET}")
+            print(f"{BOLD}{CYAN}  PHASE {phase_idx + 1}/{total_phases}: {phase_name.upper()}{RESET}")
+            print(f"{BOLD}{CYAN}{'━' * W}{RESET}")
 
-        # Dispatch tasks to each role
-        task_prompts = self._decompose_task()
-        self._dispatched_prompts = task_prompts
-        self._dispatch_time = time.time()
+            phase_roles = [t["role"] for t in phase_tasks]
 
-        for role, prompt in task_prompts.items():
-            agent_cli = self.agents[role]
-            msg = {
-                "type": "task",
-                "from": "orchestrator",
-                "to": role,
-                "payload": prompt,
-            }
-            log(f"dispatching → {BOLD}{role}{RESET} via {BOLD}{agent_cli}{RESET}", CYAN)
-            writer.write((json.dumps(msg) + "\n").encode())
+            # Inject previous phase results into prompts for later phases
+            if phase_idx > 0 and self._results:
+                context = "\n\n--- RESULTS FROM PREVIOUS PHASES ---\n"
+                for r, v in self._results.items():
+                    if not v.startswith("[ERROR]"):
+                        context += f"\n[{r}]:\n{v[:2000]}\n"
+                for t in phase_tasks:
+                    t["prompt"] = t.get("prompt", "") + context
+
+            # Update agents map for this phase
+            for t in phase_tasks:
+                self.agents[t["role"]] = t["agent"]
+                self._ai_prompts[t["role"]] = t.get("prompt", "")
+                self._dispatched_prompts[t["role"]] = t.get("prompt", "")
+
+            # Create panes and launch workers
+            self._create_phase_panes(phase_tasks)
+            self._launch_phase_workers(phase_tasks)
+
+            # Wait for workers to register
+            log(f"waiting for phase workers: {', '.join(phase_roles)}...", YELLOW)
+            writer.write(
+                (json.dumps({"type": "wait_ready", "roles": phase_roles}) + "\n").encode()
+            )
             await writer.drain()
+            try:
+                ready_line = await asyncio.wait_for(reader.readline(), timeout=30)
+                ready_msg = json.loads(ready_line.decode().strip())
+                if ready_msg.get("type") == "ready":
+                    log("workers ready", GREEN)
+            except asyncio.TimeoutError:
+                log("timeout waiting for workers — proceeding", YELLOW)
 
-        # Collect results
-        pending = set(self.agents.keys())
-        log(f"waiting for {len(pending)} results...", YELLOW)
+            # Dispatch
+            dispatch_time = time.time()
+            prompts = self._decompose_task()
 
-        try:
-            while pending:
-                line = await asyncio.wait_for(reader.readline(), timeout=600)
-                if not line:
-                    break
-                msg = json.loads(line.decode().strip())
+            for t in phase_tasks:
+                role = t["role"]
+                agent_cli = t["agent"]
+                prompt = prompts.get(role, t.get("prompt", ""))
+                self._dispatched_prompts[role] = prompt
+                msg = {
+                    "type": "task",
+                    "from": "orchestrator",
+                    "to": role,
+                    "payload": prompt,
+                }
+                log(f"  dispatch → {BOLD}{role}{RESET} via {BOLD}{agent_cli}{RESET}", CYAN)
+                writer.write((json.dumps(msg) + "\n").encode())
+                await writer.drain()
 
-                if msg.get("type") == "result":
-                    from_role = msg.get("from", "?")
-                    from_agent = msg.get("agent", self.agents.get(from_role, "?"))
-                    payload = msg.get("payload", "")
-                    elapsed = time.time() - self._dispatch_time
+            # Collect results for this phase
+            pending = set(phase_roles)
+            log(f"waiting for {len(pending)} results...", YELLOW)
 
-                    self._results[from_role] = payload
-                    self._result_agents[from_role] = from_agent
-                    self._result_times[from_role] = elapsed
-                    pending.discard(from_role)
+            try:
+                while pending:
+                    line = await asyncio.wait_for(reader.readline(), timeout=650)
+                    if not line:
+                        break
+                    msg = json.loads(line.decode().strip())
 
-                    log(
-                        f"result from {BOLD}{from_role}{RESET} "
-                        f"({BOLD}{from_agent}{RESET}, {elapsed:.1f}s) "
-                        f"— {len(pending)} remaining",
-                        GREEN,
-                    )
-                    snippet = payload[:120].replace("\n", " ")
-                    log(f"  └─ {snippet}{'...' if len(payload) > 120 else ''}", DIM)
+                    if msg.get("type") == "result":
+                        from_role = msg.get("from", "?")
+                        if from_role not in pending:
+                            continue
+                        from_agent = msg.get("agent", self.agents.get(from_role, "?"))
+                        payload = msg.get("payload", "")
+                        elapsed = time.time() - dispatch_time
 
-                    # Live context board update
-                    self._print_context_board("PROGRESS")
-        except asyncio.TimeoutError:
-            log(f"timeout — missing results from: {', '.join(pending)}", RED)
+                        self._results[from_role] = payload
+                        self._result_agents[from_role] = from_agent
+                        self._result_times[from_role] = elapsed
+                        pending.discard(from_role)
 
-        # Send shutdown
+                        log(
+                            f"  result from {BOLD}{from_role}{RESET} "
+                            f"({BOLD}{from_agent}{RESET}, {elapsed:.1f}s) "
+                            f"— {len(pending)} remaining",
+                            GREEN,
+                        )
+                        snippet = payload[:120].replace("\n", " ")
+                        log(f"    └─ {snippet}{'...' if len(payload) > 120 else ''}", DIM)
+            except asyncio.TimeoutError:
+                log(f"  timeout — missing: {', '.join(pending)}", RED)
+
+            # Close completed panes
+            log(f"phase '{phase_name}' complete — closing panes", GREEN)
+            self._close_phase_panes(phase_tasks)
+
+        # Shutdown broker connection
         writer.write((json.dumps({"type": "shutdown"}) + "\n").encode())
         await writer.drain()
         writer.close()
+
+    # Legacy single-phase dispatch (for --mock and --agents mode)
+    async def connect_and_dispatch(self) -> None:
+        """Single-phase execution (backward compat)."""
+        self._phases = [{"name": "run", "tasks": [
+            {"role": r, "agent": a, "prompt": self._ai_prompts.get(r, "")}
+            for r, a in self.agents.items()
+        ]}]
+        await self.run_phased()
 
     def _decompose_task(self) -> dict[str, str]:
         """Decompose the main task into sub-tasks for each role.
@@ -947,7 +1082,7 @@ def parse_agents(agents_str: str) -> dict[str, str]:
 
 
 async def run(args: argparse.Namespace) -> None:
-    ai_prompts: dict[str, str] | None = None  # AI-generated role prompts
+    phases: list[dict] | None = None
 
     if args.mock:
         agents = DEFAULT_MOCK_AGENTS
@@ -958,32 +1093,33 @@ async def run(args: argparse.Namespace) -> None:
     else:
         # ── Auto mode: AI planning with keyword fallback ──
         available = detect_available_agents()
-
-        # Phase 1: Try AI-powered planning via main agent (claude)
         plan = ai_plan_task(args.task, available)
 
-        if plan and "roles" in plan:
-            log("mode: AI-planned", GREEN)
+        if plan and "phases" in plan:
+            phases = plan["phases"]
+            log("mode: AI-planned (phased)", GREEN)
+
+            # Collect all agents from phases
             agents = {}
-            ai_prompts = {}
             W = 62
             print(f"\n{DIM}{'─' * W}{RESET}")
             print(f"{BOLD}{CYAN}  AI PLAN  {RESET}{DIM}(main agent: claude){RESET}")
-            print(f"{DIM}{'─' * W}{RESET}\n")
+            print(f"{DIM}{'─' * W}{RESET}")
 
-            for entry in plan["roles"]:
-                role = entry.get("role", "unknown")
-                agent = entry.get("agent", "claude-code")
-                prompt = entry.get("prompt", "")
-                agents[role] = agent
-                ai_prompts[role] = prompt
-                print(f"  {BOLD}{role}{RESET} → {BOLD}{agent}{RESET}")
-                # Show first 100 chars of the AI-generated prompt
-                snippet = prompt[:100].replace("\n", " ")
-                print(f"    {DIM}{snippet}{'...' if len(prompt) > 100 else ''}{RESET}")
-                print()
+            for pi, phase in enumerate(phases):
+                pname = phase.get("name", f"phase-{pi+1}")
+                tasks = phase.get("tasks", [])
+                print(f"\n  {BOLD}Phase {pi+1}: {pname}{RESET}  ({len(tasks)} tasks, parallel)")
+                for t in tasks:
+                    role = t.get("role", "?")
+                    agent = t.get("agent", "?")
+                    prompt = t.get("prompt", "")
+                    agents[role] = agent
+                    snippet = prompt[:90].replace("\n", " ")
+                    print(f"    {BOLD}{role}{RESET} → {agent}")
+                    print(f"      {DIM}{snippet}{'...' if len(prompt) > 90 else ''}{RESET}")
 
-            print(f"{DIM}{'─' * W}{RESET}\n")
+            print(f"\n{DIM}{'─' * W}{RESET}\n")
         else:
             # Fallback to keyword-based planning
             log("mode: keyword auto-plan (AI unavailable)", YELLOW)
@@ -996,31 +1132,28 @@ async def run(args: argparse.Namespace) -> None:
         agents=agents,
         cwd=args.cwd,
     )
-    # Override prompts if AI generated them
-    if ai_prompts:
-        session._ai_prompts = ai_prompts
+    if phases:
+        session._phases = phases
+        # Build ai_prompts from phases
+        for phase in phases:
+            for t in phase.get("tasks", []):
+                session._ai_prompts[t["role"]] = t.get("prompt", "")
 
     try:
         # Step 1: Start broker
         session.start_broker()
 
-        # Step 2: Create cmux split panes
-        session.create_panes()
+        # Step 2+3+4: Phased execution (create panes → launch → dispatch → collect → close per phase)
+        await session.run_phased()
 
-        # Step 3: Launch workers in panes
-        session.launch_workers()
-
-        # Step 4: Connect as orchestrator and dispatch tasks
-        await session.connect_and_dispatch()
-
-        # Phase 2: AI synthesis of results
+        # AI synthesis of results
         usable_results = {r: v for r, v in session._results.items() if not v.startswith("[ERROR]")}
         if usable_results and not args.mock:
             synthesis = ai_synthesize(args.task, usable_results, agents)
             if synthesis:
                 session._synthesis = synthesis
 
-        # Step 5: Print summary
+        # Print summary
         session.print_summary()
 
     except KeyboardInterrupt:
