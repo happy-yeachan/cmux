@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""
+cmux orchestrate — Multi-Agent Orchestrator
+
+Spawns multiple AI agent workers (claude-code, codex, gemini-cli) in
+cmux split panes, coordinates them via an IPC broker, and collects
+results.
+
+Usage:
+    cmux-orchestrate --task "Build a login page" \\
+        --agents frontend=claude-code,backend=codex,review=gemini-cli
+
+    cmux-orchestrate --task "Refactor auth module" --mock
+
+    cmux-orchestrate --task "Add unit tests" \\
+        --agents tests=claude-code,review=gemini-cli
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ── ANSI colors ──────────────────────────────────────────────────────
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN = "\033[36m"
+WHITE = "\033[37m"
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SOCKET_PATH = os.environ.get(
+    "CMUX_ORCHESTRATE_SOCK", "/tmp/cmux-orchestrate.sock"
+)
+
+# Default agent assignment when --mock is used
+DEFAULT_MOCK_AGENTS = {
+    "frontend": "mock",
+    "backend": "mock",
+    "review": "mock",
+}
+
+
+def log(msg: str, color: str = DIM) -> None:
+    ts = time.strftime("%H:%M:%S")
+    print(
+        f"{DIM}{ts}{RESET} {BOLD}{MAGENTA}[orchestrate]{RESET} {color}{msg}{RESET}",
+        flush=True,
+    )
+
+
+def banner() -> None:
+    print(f"""
+{BOLD}{MAGENTA}╔══════════════════════════════════════════════════════╗
+║                                                      ║
+║   {CYAN}cmux orchestrate{MAGENTA}  —  Multi-Agent Orchestrator     ║
+║                                                      ║
+║   Spawn specialized AI agents in cmux split panes    ║
+║   and coordinate them via lightweight IPC.            ║
+║                                                      ║
+╚══════════════════════════════════════════════════════╝{RESET}
+""", flush=True)
+
+
+# ── cmux CLI helpers ─────────────────────────────────────────────────
+
+def cmux(*args: str, json_output: bool = False) -> str:
+    """Run a cmux CLI command and return stdout."""
+    cmd = ["cmux"]
+    if json_output:
+        cmd.append("--json")
+    cmd.extend(args)
+    log(f"$ {' '.join(cmd)}", DIM)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        err = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"cmux command failed: {' '.join(args)}\n{err}")
+    return result.stdout.strip()
+
+
+def cmux_split(direction: str = "right") -> str:
+    """Split the current pane and return the new surface ref."""
+    output = cmux("new-split", direction, json_output=True)
+    try:
+        data = json.loads(output)
+        # Try various key names the API might return
+        surface_id = (
+            data.get("created_surface_ref")
+            or data.get("created_surface_id")
+            or data.get("created_tab_ref")
+            or data.get("created_tab_id")
+            or data.get("surface_id")
+            or ""
+        )
+        return surface_id
+    except json.JSONDecodeError:
+        # Fallback: parse "OK surface:N" format
+        if output.startswith("OK "):
+            return output.split()[-1]
+        return ""
+
+
+def cmux_send(text: str, surface: str | None = None) -> None:
+    """Send text to a cmux surface."""
+    args = ["send"]
+    if surface:
+        args.extend(["--surface", surface])
+    args.append("--")
+    args.append(text + "\\n")
+    cmux(*args)
+
+
+def cmux_list_panes() -> list[dict]:
+    """List current panes."""
+    output = cmux("list-panes", json_output=True)
+    try:
+        data = json.loads(output)
+        return data.get("panes", [])
+    except json.JSONDecodeError:
+        return []
+
+
+# ── Process management ───────────────────────────────────────────────
+
+class OrchestrateSession:
+    def __init__(
+        self,
+        task: str,
+        agents: dict[str, str],
+        cwd: str | None = None,
+    ) -> None:
+        self.task = task
+        self.agents = agents  # role -> agent_cli
+        self.cwd = cwd or os.getcwd()
+        self.broker_proc: subprocess.Popen | None = None
+        self.surface_ids: dict[str, str] = {}  # role -> surface ref
+        self._results: dict[str, str] = {}
+
+    def start_broker(self) -> None:
+        """Launch the IPC broker as a background process."""
+        log("starting IPC broker...", CYAN)
+        env = os.environ.copy()
+        env["CMUX_ORCHESTRATE_SOCK"] = SOCKET_PATH
+        self.broker_proc = subprocess.Popen(
+            [sys.executable, str(SCRIPT_DIR / "broker.py")],
+            env=env,
+            # Let broker output go to its own pane (or current terminal)
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Wait for socket to appear
+        sock_path = Path(SOCKET_PATH)
+        for _ in range(30):
+            if sock_path.exists():
+                log("broker ready", GREEN)
+                return
+            time.sleep(0.2)
+        raise RuntimeError("Broker failed to start within 6 seconds")
+
+    def create_panes(self) -> None:
+        """Split cmux into panes for each agent role."""
+        roles = list(self.agents.keys())
+        log(f"creating {len(roles)} agent panes: {', '.join(roles)}", CYAN)
+
+        for i, role in enumerate(roles):
+            # Alternate split directions for a nice layout
+            direction = "right" if i % 2 == 0 else "down"
+            try:
+                surface = cmux_split(direction)
+                self.surface_ids[role] = surface
+                log(f"  pane for '{role}' → {surface or '(default)'}", GREEN)
+                # Small delay for cmux to settle
+                time.sleep(0.3)
+            except RuntimeError as e:
+                log(f"  failed to create pane for '{role}': {e}", RED)
+                # Fall back: run in current pane without split
+                self.surface_ids[role] = ""
+
+    def launch_workers(self) -> None:
+        """Send worker launch commands into each pane."""
+        log("launching agent workers...", CYAN)
+        worker_script = str(SCRIPT_DIR / "agent_worker.py")
+
+        for role, agent_cli in self.agents.items():
+            surface = self.surface_ids.get(role)
+            cmd = (
+                f"python3 {worker_script} "
+                f"--role {role} "
+                f"--agent {agent_cli} "
+                f"--socket {SOCKET_PATH}"
+            )
+            log(f"  [{role}] {agent_cli} → {surface or 'current'}", GREEN)
+            try:
+                cmux_send(cmd, surface=surface if surface else None)
+            except RuntimeError as e:
+                log(f"  failed to launch worker '{role}': {e}", RED)
+
+    async def connect_and_dispatch(self) -> None:
+        """Connect to broker as orchestrator and dispatch tasks."""
+        # Connect to broker
+        for attempt in range(15):
+            try:
+                reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
+                break
+            except (FileNotFoundError, ConnectionRefusedError):
+                await asyncio.sleep(0.5)
+        else:
+            raise ConnectionError("Could not connect to broker")
+
+        # Register as orchestrator
+        writer.write(
+            (json.dumps({"type": "register", "role": "orchestrator"}) + "\n").encode()
+        )
+        await writer.drain()
+        resp_line = await reader.readline()
+        log("connected to broker as orchestrator", GREEN)
+
+        # Wait for all agent roles to register
+        roles = list(self.agents.keys())
+        log(f"waiting for agents to register: {', '.join(roles)}...", YELLOW)
+        writer.write(
+            (json.dumps({"type": "wait_ready", "roles": roles}) + "\n").encode()
+        )
+        await writer.drain()
+
+        # Wait for ready response (with timeout)
+        try:
+            ready_line = await asyncio.wait_for(reader.readline(), timeout=30)
+            ready_msg = json.loads(ready_line.decode().strip())
+            if ready_msg.get("type") == "ready":
+                log("all agents ready!", GREEN)
+        except asyncio.TimeoutError:
+            log("timeout waiting for agents — proceeding anyway", YELLOW)
+
+        # Dispatch tasks to each role
+        task_prompts = self._decompose_task()
+
+        for role, prompt in task_prompts.items():
+            msg = {
+                "type": "task",
+                "from": "orchestrator",
+                "to": role,
+                "payload": prompt,
+            }
+            log(f"dispatching task → {role}", CYAN)
+            writer.write((json.dumps(msg) + "\n").encode())
+            await writer.drain()
+
+        # Collect results
+        pending = set(self.agents.keys())
+        log(f"waiting for {len(pending)} results...", YELLOW)
+
+        try:
+            while pending:
+                line = await asyncio.wait_for(reader.readline(), timeout=600)
+                if not line:
+                    break
+                msg = json.loads(line.decode().strip())
+
+                if msg.get("type") == "result":
+                    from_role = msg.get("from", "?")
+                    payload = msg.get("payload", "")
+                    self._results[from_role] = payload
+                    pending.discard(from_role)
+                    log(f"result received from {from_role} ({len(pending)} remaining)", GREEN)
+                    # Print result snippet
+                    snippet = payload[:150].replace("\n", " ")
+                    log(f"  └─ {snippet}{'...' if len(payload) > 150 else ''}", DIM)
+        except asyncio.TimeoutError:
+            log(f"timeout — missing results from: {', '.join(pending)}", RED)
+
+        # Send shutdown
+        writer.write((json.dumps({"type": "shutdown"}) + "\n").encode())
+        await writer.drain()
+        writer.close()
+
+    def _decompose_task(self) -> dict[str, str]:
+        """
+        Decompose the main task into sub-tasks for each role.
+
+        MVP: simple role-based prompt templates.
+        Production: use an LLM to intelligently decompose.
+        """
+        prompts: dict[str, str] = {}
+        roles = list(self.agents.keys())
+
+        for role in roles:
+            if role == "frontend":
+                prompts[role] = (
+                    f"You are the frontend specialist. "
+                    f"For the following task, implement the UI/frontend parts:\n\n"
+                    f"Task: {self.task}\n\n"
+                    f"Focus on: components, layout, styling, user interactions."
+                )
+            elif role == "backend":
+                prompts[role] = (
+                    f"You are the backend specialist. "
+                    f"For the following task, implement the backend/logic parts:\n\n"
+                    f"Task: {self.task}\n\n"
+                    f"Focus on: API endpoints, data models, business logic, database."
+                )
+            elif role == "review":
+                prompts[role] = (
+                    f"You are the code reviewer. "
+                    f"Review the work done for the following task:\n\n"
+                    f"Task: {self.task}\n\n"
+                    f"Focus on: correctness, security, performance, best practices."
+                )
+            else:
+                prompts[role] = (
+                    f"You are the {role} specialist. "
+                    f"Handle the {role}-related parts of this task:\n\n"
+                    f"Task: {self.task}"
+                )
+
+        return prompts
+
+    def print_summary(self) -> None:
+        """Print final results summary."""
+        print(f"\n{'=' * 60}")
+        print(f"{BOLD}{GREEN}  ORCHESTRATION COMPLETE{RESET}")
+        print(f"{'=' * 60}")
+        print(f"\n{BOLD}Task:{RESET} {self.task}\n")
+
+        for role, result in self._results.items():
+            agent = self.agents.get(role, "unknown")
+            rc = {
+                "frontend": CYAN,
+                "backend": GREEN,
+                "review": YELLOW,
+            }.get(role, WHITE)
+            print(f"{BOLD}{rc}── {role} ({agent}) ──{RESET}")
+            # Indent result
+            for line in result.split("\n")[:20]:
+                print(f"  {line}")
+            if result.count("\n") > 20:
+                print(f"  {DIM}... ({result.count(chr(10)) - 20} more lines){RESET}")
+            print()
+
+        missing = set(self.agents.keys()) - set(self._results.keys())
+        if missing:
+            print(f"{RED}Missing results from: {', '.join(missing)}{RESET}\n")
+
+        print(f"{'=' * 60}\n")
+
+    def cleanup(self) -> None:
+        """Stop broker and clean up resources."""
+        log("cleaning up...", YELLOW)
+
+        # Stop broker
+        if self.broker_proc and self.broker_proc.poll() is None:
+            self.broker_proc.terminate()
+            try:
+                self.broker_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.broker_proc.kill()
+            log("broker stopped", GREEN)
+
+        # Clean socket
+        sock = Path(SOCKET_PATH)
+        if sock.exists():
+            sock.unlink()
+        pid_file = Path(SOCKET_PATH + ".pid")
+        if pid_file.exists():
+            pid_file.unlink()
+
+        log("cleanup complete", GREEN)
+
+
+# ── Entry point ──────────────────────────────────────────────────────
+
+def parse_agents(agents_str: str) -> dict[str, str]:
+    """Parse 'role=agent,role=agent' into dict."""
+    result = {}
+    for pair in agents_str.split(","):
+        pair = pair.strip()
+        if "=" in pair:
+            role, agent = pair.split("=", 1)
+            result[role.strip()] = agent.strip()
+        else:
+            raise ValueError(
+                f"Invalid agent spec '{pair}'. Expected 'role=agent' "
+                f"(e.g., frontend=claude-code)"
+            )
+    return result
+
+
+async def run(args: argparse.Namespace) -> None:
+    if args.mock:
+        agents = DEFAULT_MOCK_AGENTS
+    else:
+        agents = parse_agents(args.agents)
+
+    session = OrchestrateSession(
+        task=args.task,
+        agents=agents,
+        cwd=args.cwd,
+    )
+
+    try:
+        # Step 1: Start broker
+        session.start_broker()
+
+        # Step 2: Create cmux split panes
+        session.create_panes()
+
+        # Step 3: Launch workers in panes
+        session.launch_workers()
+
+        # Step 4: Connect as orchestrator and dispatch tasks
+        await session.connect_and_dispatch()
+
+        # Step 5: Print summary
+        session.print_summary()
+
+    except KeyboardInterrupt:
+        log("interrupted", YELLOW)
+    except Exception as e:
+        log(f"error: {e}", RED)
+        raise
+    finally:
+        session.cleanup()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="cmux orchestrate — Multi-Agent Orchestrator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Mock mode (no real agents, great for testing)
+  cmux-orchestrate --task "Build a dashboard" --mock
+
+  # Real agents
+  cmux-orchestrate --task "Build a login page" \\
+      --agents frontend=claude-code,backend=codex,review=gemini-cli
+
+  # Two agents only
+  cmux-orchestrate --task "Add unit tests" \\
+      --agents tests=claude-code,review=gemini-cli
+        """,
+    )
+    parser.add_argument(
+        "--task", required=True,
+        help="The task to distribute across agents"
+    )
+    parser.add_argument(
+        "--agents", default="",
+        help="Agent assignments: role=agent,... "
+             "(e.g., frontend=claude-code,backend=codex,review=gemini-cli)"
+    )
+    parser.add_argument(
+        "--mock", action="store_true",
+        help="Use mock agents (for testing/demo)"
+    )
+    parser.add_argument(
+        "--cwd", default=None,
+        help="Working directory for agents (default: current directory)"
+    )
+    parser.add_argument(
+        "--socket", default=None,
+        help="Broker socket path (default: /tmp/cmux-orchestrate.sock)"
+    )
+
+    args = parser.parse_args()
+
+    if not args.mock and not args.agents:
+        parser.error("Either --agents or --mock is required")
+
+    if args.socket:
+        global SOCKET_PATH
+        SOCKET_PATH = args.socket
+
+    banner()
+    log(f"task: {args.task}", WHITE)
+    log(f"agents: {args.agents if args.agents else 'mock (frontend, backend, review)'}", WHITE)
+    log(f"cwd: {args.cwd or os.getcwd()}", DIM)
+    print()
+
+    asyncio.run(run(args))
+
+
+if __name__ == "__main__":
+    main()
