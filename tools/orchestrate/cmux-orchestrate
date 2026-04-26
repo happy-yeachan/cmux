@@ -218,7 +218,7 @@ Respond with ONLY a JSON object:
     local start=$SECONDS
     local result
     # Run main agent in a visible cmux pane
-    result=$(run_in_pane "planner" "claude --dangerously-skip-permissions < __PROMPT_FILE__" "$prompt") || {
+    result=$(run_in_pane "planner" "(cat __PROMPT_FILE__; echo; echo '/exit') | claude --dangerously-skip-permissions" "$prompt") || {
         err "main agent failed"
         return 1
     }
@@ -561,7 +561,7 @@ Respond with ONLY a JSON object:
 - To add:     {\"action\": \"add\", \"phase\": {\"name\": \"...\", \"tasks\": [{\"role\": \"...\", \"agent\": \"...\", \"prompt\": \"...\"}]}}"
 
             local decision
-            decision=$(run_in_pane "reviewer-p$((p+1))" "claude --dangerously-skip-permissions < __PROMPT_FILE__" "$review_prompt") || true
+            decision=$(run_in_pane "reviewer-p$((p+1))" "(cat __PROMPT_FILE__; echo; echo '/exit') | claude --dangerously-skip-permissions" "$review_prompt") || true
 
             # Parse decision
             local action_json
@@ -621,7 +621,7 @@ ${all_context}
 Provide: 1) Summary of what each agent did 2) Integration issues 3) Gaps 4) Verdict (complete/partial/failed). Be concise."
 
             local synthesis
-            synthesis=$(run_in_pane "synthesis" "claude --dangerously-skip-permissions < __PROMPT_FILE__" "$synth_prompt") || true
+            synthesis=$(run_in_pane "synthesis" "(cat __PROMPT_FILE__; echo; echo '/exit') | claude --dangerously-skip-permissions" "$synth_prompt") || true
 
             if [[ -n "$synthesis" ]]; then
                 printf "\n${BOLD}${MAG}── AI SYNTHESIS ──${RST}\n\n"
