@@ -22,6 +22,9 @@ import argparse
 import asyncio
 import json
 import os
+import pty
+import re
+import select
 import shutil
 import signal
 import subprocess
@@ -218,6 +221,185 @@ def print_auto_plan(task: str, available: list[dict], roles: list[str], assignme
     print(f"\n{DIM}{'─' * W}{RESET}\n")
 
 
+# ── AI-powered planning & synthesis (Main Agent = claude --print) ─────
+
+def _call_claude(prompt: str, timeout: float = 120) -> str | None:
+    """Call claude --print and return output. Returns None on failure."""
+    cmd = ["claude", "--print", "--output-format", "text", "-p", prompt]
+    master, slave = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=slave, stderr=slave, stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        os.close(master)
+        os.close(slave)
+        return None
+    os.close(slave)
+
+    chunks: list[bytes] = []
+    deadline = time.time() + timeout
+    while proc.poll() is None:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            proc.kill()
+            proc.wait()
+            os.close(master)
+            return None
+        r, _, _ = select.select([master], [], [], min(remaining, 0.5))
+        if r:
+            try:
+                chunks.append(os.read(master, 8192))
+            except OSError:
+                break
+    # Drain
+    while True:
+        r, _, _ = select.select([master], [], [], 0.1)
+        if not r:
+            break
+        try:
+            data = os.read(master, 8192)
+            if not data:
+                break
+            chunks.append(data)
+        except OSError:
+            break
+    os.close(master)
+
+    if proc.returncode != 0:
+        return None
+    text = b"".join(chunks).decode(errors="replace")
+    text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
+    text = re.sub(r"\x1b\].*?\x07", "", text)
+    return text.strip()
+
+
+def _extract_json(text: str) -> dict | None:
+    """Extract a JSON object from text that may contain markdown fences."""
+    # Try direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Try extracting from ```json ... ``` block
+    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    # Try finding first { ... } block
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    return json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    start = None
+    return None
+
+
+def ai_plan_task(task: str, available_agents: list[dict]) -> dict | None:
+    """Use claude as main agent to decompose task into roles + prompts.
+
+    Returns dict like:
+      {
+        "roles": [
+          {"role": "frontend", "agent": "claude-code", "prompt": "..."},
+          {"role": "backend", "agent": "codex", "prompt": "..."},
+          ...
+        ]
+      }
+    Or None if AI planning fails.
+    """
+    agent_descriptions = "\n".join(
+        f"  - {a['name']}: {a['description']} (strengths: {', '.join(a['strengths'])})"
+        for a in available_agents
+    )
+
+    prompt = f"""You are the orchestrator for a multi-agent coding system.
+
+AVAILABLE AGENTS:
+{agent_descriptions}
+
+TASK:
+{task}
+
+Analyze this task and decompose it. For each sub-task, assign the best-fit agent and write a specific, detailed prompt.
+
+Rules:
+- Choose only from the available agents listed above.
+- Each role name should be a short lowercase word (e.g., frontend, backend, review, test, devops, docs).
+- Always include a "review" role that will review the other agents' outputs.
+- Write prompts that are specific to THIS task, not generic templates.
+- The review agent's prompt should reference what the other agents are doing.
+- Max 4 roles.
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{{"roles": [{{"role": "...", "agent": "...", "prompt": "..."}}]}}"""
+
+    log("main agent (claude) analyzing task...", CYAN)
+    start = time.time()
+    result = _call_claude(prompt, timeout=120)
+    elapsed = time.time() - start
+
+    if not result:
+        log(f"main agent failed ({elapsed:.1f}s) — falling back to keyword plan", RED)
+        return None
+
+    log(f"main agent responded ({elapsed:.1f}s)", GREEN)
+    parsed = _extract_json(result)
+    if not parsed or "roles" not in parsed:
+        log(f"main agent returned invalid JSON — falling back", RED)
+        log(f"  raw: {result[:200]}", DIM)
+        return None
+
+    return parsed
+
+
+def ai_synthesize(task: str, results: dict[str, str], agents: dict[str, str]) -> str | None:
+    """Use claude to synthesize all agent results into a unified analysis."""
+    results_text = ""
+    for role, output in results.items():
+        agent = agents.get(role, "unknown")
+        truncated = output[:3000]
+        results_text += f"\n--- {role} ({agent}) ---\n{truncated}\n"
+
+    prompt = f"""You are reviewing the outputs of a multi-agent coding task.
+
+ORIGINAL TASK: {task}
+
+AGENT RESULTS:
+{results_text}
+
+Analyze the combined results and provide:
+1. **Summary**: What was accomplished by each agent (1-2 sentences each)
+2. **Integration issues**: Do the outputs conflict? (e.g., mismatched API contracts, incompatible assumptions)
+3. **Gaps**: What's missing that no agent addressed?
+4. **Verdict**: Is the task complete, partially complete, or failed?
+
+Be specific and concise."""
+
+    log("main agent synthesizing results...", CYAN)
+    start = time.time()
+    result = _call_claude(prompt, timeout=120)
+    elapsed = time.time() - start
+
+    if not result:
+        log(f"synthesis failed ({elapsed:.1f}s)", RED)
+        return None
+
+    log(f"synthesis complete ({elapsed:.1f}s)", GREEN)
+    return result
+
+
 def log(msg: str, color: str = DIM) -> None:
     ts = time.strftime("%H:%M:%S")
     print(
@@ -324,6 +506,8 @@ class OrchestrateSession:
         self._result_times: dict[str, float] = {}  # role -> elapsed seconds
         self._dispatched_prompts: dict[str, str] = {}  # role -> prompt sent
         self._dispatch_time: float = 0.0
+        self._ai_prompts: dict[str, str] = {}  # AI-generated prompts (if available)
+        self._synthesis: str | None = None  # AI synthesis of results
 
     def start_broker(self) -> None:
         """Launch the IPC broker as a background process."""
@@ -523,43 +707,35 @@ class OrchestrateSession:
         writer.close()
 
     def _decompose_task(self) -> dict[str, str]:
-        """
-        Decompose the main task into sub-tasks for each role.
+        """Decompose the main task into sub-tasks for each role.
 
-        MVP: simple role-based prompt templates.
-        Production: use an LLM to intelligently decompose.
+        Uses AI-generated prompts if available, falls back to templates.
         """
+        # If main agent provided specific prompts, use them
+        if self._ai_prompts:
+            prompts = {}
+            for role in self.agents:
+                if role in self._ai_prompts:
+                    prompts[role] = self._ai_prompts[role]
+                else:
+                    prompts[role] = (
+                        f"You are the {role} specialist. "
+                        f"Handle the {role}-related parts of this task:\n\n"
+                        f"Task: {self.task}"
+                    )
+            return prompts
+
+        # Fallback: static templates
         prompts: dict[str, str] = {}
-        roles = list(self.agents.keys())
+        templates = {
+            "frontend": "You are the frontend specialist. For the following task, implement the UI/frontend parts:\n\nTask: {task}\n\nFocus on: components, layout, styling, user interactions.",
+            "backend": "You are the backend specialist. For the following task, implement the backend/logic parts:\n\nTask: {task}\n\nFocus on: API endpoints, data models, business logic, database.",
+            "review": "You are the code reviewer. Review the work done for the following task:\n\nTask: {task}\n\nFocus on: correctness, security, performance, best practices.",
+        }
 
-        for role in roles:
-            if role == "frontend":
-                prompts[role] = (
-                    f"You are the frontend specialist. "
-                    f"For the following task, implement the UI/frontend parts:\n\n"
-                    f"Task: {self.task}\n\n"
-                    f"Focus on: components, layout, styling, user interactions."
-                )
-            elif role == "backend":
-                prompts[role] = (
-                    f"You are the backend specialist. "
-                    f"For the following task, implement the backend/logic parts:\n\n"
-                    f"Task: {self.task}\n\n"
-                    f"Focus on: API endpoints, data models, business logic, database."
-                )
-            elif role == "review":
-                prompts[role] = (
-                    f"You are the code reviewer. "
-                    f"Review the work done for the following task:\n\n"
-                    f"Task: {self.task}\n\n"
-                    f"Focus on: correctness, security, performance, best practices."
-                )
-            else:
-                prompts[role] = (
-                    f"You are the {role} specialist. "
-                    f"Handle the {role}-related parts of this task:\n\n"
-                    f"Task: {self.task}"
-                )
+        for role in self.agents:
+            template = templates.get(role, "You are the {role} specialist. Handle the {role}-related parts of this task:\n\nTask: {task}")
+            prompts[role] = template.format(task=self.task, role=role)
 
         return prompts
 
@@ -717,7 +893,16 @@ class OrchestrateSession:
         else:
             print(f"\n  {RED}{BOLD}All agents failed. No usable context collected.{RESET}")
 
-        print(f"\n{BOLD}{'═' * W}{RESET}\n")
+        # ── 5. AI Synthesis (if available) ──
+        if self._synthesis:
+            print(f"\n{BOLD}{'─' * W}{RESET}")
+            print(f"{BOLD}{MAGENTA}  AI SYNTHESIS  {RESET}{DIM}(main agent: claude){RESET}")
+            print(f"{BOLD}{'─' * W}{RESET}\n")
+            for line in self._synthesis.split("\n"):
+                print(f"  {line}")
+            print()
+
+        print(f"{BOLD}{'═' * W}{RESET}\n")
 
     def cleanup(self) -> None:
         """Stop broker and clean up resources."""
@@ -762,6 +947,8 @@ def parse_agents(agents_str: str) -> dict[str, str]:
 
 
 async def run(args: argparse.Namespace) -> None:
+    ai_prompts: dict[str, str] | None = None  # AI-generated role prompts
+
     if args.mock:
         agents = DEFAULT_MOCK_AGENTS
         log("mode: mock", DIM)
@@ -769,18 +956,49 @@ async def run(args: argparse.Namespace) -> None:
         agents = parse_agents(args.agents)
         log("mode: manual assignment", DIM)
     else:
-        # ── Auto mode: detect, analyze, assign ──
-        log("mode: auto-plan", CYAN)
+        # ── Auto mode: AI planning with keyword fallback ──
         available = detect_available_agents()
-        roles = analyze_task_roles(args.task)
-        agents = assign_agents(roles, available)
-        print_auto_plan(args.task, available, roles, agents)
+
+        # Phase 1: Try AI-powered planning via main agent (claude)
+        plan = ai_plan_task(args.task, available)
+
+        if plan and "roles" in plan:
+            log("mode: AI-planned", GREEN)
+            agents = {}
+            ai_prompts = {}
+            W = 62
+            print(f"\n{DIM}{'─' * W}{RESET}")
+            print(f"{BOLD}{CYAN}  AI PLAN  {RESET}{DIM}(main agent: claude){RESET}")
+            print(f"{DIM}{'─' * W}{RESET}\n")
+
+            for entry in plan["roles"]:
+                role = entry.get("role", "unknown")
+                agent = entry.get("agent", "claude-code")
+                prompt = entry.get("prompt", "")
+                agents[role] = agent
+                ai_prompts[role] = prompt
+                print(f"  {BOLD}{role}{RESET} → {BOLD}{agent}{RESET}")
+                # Show first 100 chars of the AI-generated prompt
+                snippet = prompt[:100].replace("\n", " ")
+                print(f"    {DIM}{snippet}{'...' if len(prompt) > 100 else ''}{RESET}")
+                print()
+
+            print(f"{DIM}{'─' * W}{RESET}\n")
+        else:
+            # Fallback to keyword-based planning
+            log("mode: keyword auto-plan (AI unavailable)", YELLOW)
+            roles = analyze_task_roles(args.task)
+            agents = assign_agents(roles, available)
+            print_auto_plan(args.task, available, roles, agents)
 
     session = OrchestrateSession(
         task=args.task,
         agents=agents,
         cwd=args.cwd,
     )
+    # Override prompts if AI generated them
+    if ai_prompts:
+        session._ai_prompts = ai_prompts
 
     try:
         # Step 1: Start broker
@@ -794,6 +1012,13 @@ async def run(args: argparse.Namespace) -> None:
 
         # Step 4: Connect as orchestrator and dispatch tasks
         await session.connect_and_dispatch()
+
+        # Phase 2: AI synthesis of results
+        usable_results = {r: v for r, v in session._results.items() if not v.startswith("[ERROR]")}
+        if usable_results and not args.mock:
+            synthesis = ai_synthesize(args.task, usable_results, agents)
+            if synthesis:
+                session._synthesis = synthesis
 
         # Step 5: Print summary
         session.print_summary()
