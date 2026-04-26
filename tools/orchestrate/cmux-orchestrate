@@ -748,8 +748,9 @@ class OrchestrateSession:
             # Update agents map for this phase
             for t in phase_tasks:
                 self.agents[t["role"]] = t["agent"]
-                self._ai_prompts[t["role"]] = t.get("prompt", "")
-                self._dispatched_prompts[t["role"]] = t.get("prompt", "")
+                # Only set AI prompts if non-empty (empty → falls through to templates)
+                if t.get("prompt"):
+                    self._ai_prompts[t["role"]] = t["prompt"]
 
             # Create panes and launch workers
             self._create_phase_panes(phase_tasks)
@@ -847,7 +848,7 @@ class OrchestrateSession:
         Uses AI-generated prompts if available, falls back to templates.
         """
         # If main agent provided specific prompts, use them
-        if self._ai_prompts:
+        if self._ai_prompts and any(self._ai_prompts.values()):
             prompts = {}
             for role in self.agents:
                 if role in self._ai_prompts:
