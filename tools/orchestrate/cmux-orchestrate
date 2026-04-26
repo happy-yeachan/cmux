@@ -109,6 +109,51 @@ cmux_close() {
     cmux close-surface --surface "$surface" >/dev/null 2>&1 || true
 }
 
+# Run a command in a cmux pane (interactive, visible to user).
+# Creates a pane, runs the command via script capture, waits, collects output, closes pane.
+# Usage: result=$(run_in_pane "label" "command" "prompt_text")
+run_in_pane() {
+    local label="$1" agent_cmd="$2" prompt_text="$3"
+    local sid capture prompt_file
+
+    # Create pane
+    sid=$(cmux_split "right") || { err "failed to create pane for $label"; return 1; }
+    log "  ${BOLD}[$label]${RST} pane → $sid"
+
+    # Write prompt to file
+    prompt_file="$CAPTURE_DIR/prompt-${label}.txt"
+    printf '%s' "$prompt_text" > "$prompt_file"
+
+    # Build full command with prompt file
+    capture="$CAPTURE_DIR/capture-${label}.log"
+    local full_cmd
+    full_cmd=$(echo "$agent_cmd" | sed "s|__PROMPT_FILE__|${prompt_file}|g")
+
+    # Send to pane
+    cmux_send "$sid" "script -q $(printf '%q' "$capture") bash -c $(printf '%q' "$full_cmd")"
+
+    # Wait for capture file to appear
+    local wait_count=0
+    while [[ ! -f "$capture" ]] && [[ $wait_count -lt 30 ]]; do
+        sleep 1; wait_count=$((wait_count + 1))
+    done
+
+    # Wait for completion
+    wait_for_completion "$capture" "$label"
+
+    # Read result
+    local result=""
+    if [[ -f "$capture" ]]; then
+        result=$(sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$capture" | tail -c 10000)
+    fi
+
+    # Close pane
+    cmux_close "$sid"
+    log "  ${GRN}[$label] done, pane closed${RST}"
+
+    echo "$result"
+}
+
 # ── Wait for agent completion ────────────────────────────────────────
 # No timeout. Polls capture file size. Stops when stable for 30s.
 wait_for_completion() {
@@ -169,10 +214,14 @@ Rules:
 Respond with ONLY a JSON object:
 {\"phases\": [{\"name\": \"...\", \"tasks\": [{\"role\": \"...\", \"agent\": \"...\", \"prompt\": \"...\"}]}]}"
 
-    log "${CYN}main agent analyzing task...${RST}"
+    log "${CYN}main agent analyzing task (interactive)...${RST}"
     local start=$SECONDS
     local result
-    result=$(claude --print -p "$prompt" 2>/dev/null) || { err "main agent failed"; return 1; }
+    # Run main agent in a visible cmux pane
+    result=$(run_in_pane "planner" "claude --dangerously-skip-permissions < __PROMPT_FILE__" "$prompt") || {
+        err "main agent failed"
+        return 1
+    }
     local elapsed=$((SECONDS - start))
     log "${GRN}main agent responded (${elapsed}s)${RST}"
 
@@ -477,21 +526,23 @@ main() {
     # Step 3: Report
     print_report
 
-    # Step 4: AI Synthesis (optional)
-    if ! $MOCK && command -v claude >/dev/null 2>&1; then
+    # Step 4: AI Synthesis (interactive, visible in pane)
+    if ! $MOCK; then
         local all_context
         all_context=$(collect_context)
         if [[ -n "$all_context" ]]; then
-            log "${CYN}main agent synthesizing results...${RST}"
-            local synthesis
-            synthesis=$(claude --print -p "You reviewed a multi-agent task.
+            log "${CYN}main agent synthesizing results (interactive)...${RST}"
+            local synth_prompt="You reviewed a multi-agent task.
 
 TASK: ${TASK}
 
 RESULTS:
 ${all_context}
 
-Provide: 1) Summary of what each agent did 2) Integration issues 3) Gaps 4) Verdict (complete/partial/failed). Be concise." 2>/dev/null) || true
+Provide: 1) Summary of what each agent did 2) Integration issues 3) Gaps 4) Verdict (complete/partial/failed). Be concise."
+
+            local synthesis
+            synthesis=$(run_in_pane "synthesis" "claude --dangerously-skip-permissions < __PROMPT_FILE__" "$synth_prompt") || true
 
             if [[ -n "$synthesis" ]]; then
                 printf "\n${BOLD}${MAG}── AI SYNTHESIS ──${RST}\n\n"
