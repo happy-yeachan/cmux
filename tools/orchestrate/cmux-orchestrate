@@ -1,1319 +1,511 @@
-#!/usr/bin/env python3
-"""
-cmux orchestrate — Multi-Agent Orchestrator
+#!/usr/bin/env bash
+set -euo pipefail
 
-Spawns multiple AI agent workers (claude-code, codex, gemini-cli) in
-cmux split panes, coordinates them via an IPC broker, and collects
-results.
+# ── cmux orchestrate ─────────────────────────────────────────────────
+# Multi-agent orchestrator. Splits cmux panes, runs AI agents in each,
+# collects results via capture files, passes context between phases.
+#
+# Usage:
+#   cmux-orchestrate --task "Build a dashboard" --cwd ~/projects/app
+#   cmux-orchestrate --task "Build a dashboard" --mock
+# ─────────────────────────────────────────────────────────────────────
 
-Usage:
-    # Auto mode: detect agents and assign roles automatically
-    cmux-orchestrate --task "Build a login page"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+AGENTS_JSON="${CMUX_ORCHESTRATE_AGENTS:-$SCRIPT_DIR/agents.json}"
+CAPTURE_DIR="/tmp/cmux-orchestrate-$$"
 
-    # Manual override
-    cmux-orchestrate --task "Build a login page" \\
-        --agents frontend=claude-code,backend=codex,review=gemini-cli
+# ── Colors ───────────────────────────────────────────────────────────
+RST="\033[0m"; BOLD="\033[1m"; DIM="\033[2m"
+RED="\033[31m"; GRN="\033[32m"; YLW="\033[33m"
+BLU="\033[34m"; MAG="\033[35m"; CYN="\033[36m"
 
-    # Mock mode (testing)
-    cmux-orchestrate --task "Refactor auth module" --mock
-"""
+log() { printf "${DIM}%s${RST} ${BOLD}${MAG}[orchestrate]${RST} %b${RST}\n" "$(date +%H:%M:%S)" "$1"; }
+err() { log "${RED}$1"; }
 
-import argparse
-import asyncio
-import json
-import os
-import pty
-import re
-import select
-import shlex
-import shutil
-import signal
-import subprocess
-import sys
-import time
-from pathlib import Path
+# ── CLI Args ─────────────────────────────────────────────────────────
+TASK="" CWD="" MOCK=false
 
-# ── ANSI colors ──────────────────────────────────────────────────────
-RESET = "\033[0m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-RED = "\033[31m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-BLUE = "\033[34m"
-MAGENTA = "\033[35m"
-CYAN = "\033[36m"
-WHITE = "\033[37m"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --task)  TASK="$2"; shift 2 ;;
+        --cwd)   CWD="$2"; shift 2 ;;
+        --mock)  MOCK=true; shift ;;
+        --help)
+            echo "Usage: cmux-orchestrate --task <task> [--cwd <dir>] [--mock]"
+            echo "  --task   Task description (required)"
+            echo "  --cwd    Working directory for agents (default: current dir)"
+            echo "  --mock   Run mock agents (testing)"
+            exit 0 ;;
+        *) echo "Unknown arg: $1"; exit 1 ;;
+    esac
+done
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-SOCKET_PATH = os.environ.get(
-    "CMUX_ORCHESTRATE_SOCK", "/tmp/cmux-orchestrate.sock"
-)
+[[ -z "$TASK" ]] && { echo "Error: --task is required"; exit 1; }
+CWD="${CWD:-$(pwd)}"
+mkdir -p "$CWD" "$CAPTURE_DIR"
 
-# Default agent assignment when --mock is used
-DEFAULT_MOCK_AGENTS = {
-    "frontend": "mock",
-    "backend": "mock",
-    "review": "mock",
+# ── Banner ───────────────────────────────────────────────────────────
+printf "\n${BOLD}${MAG}"
+echo "╔══════════════════════════════════════════════════════╗"
+echo "║                                                      ║"
+echo "║   cmux orchestrate  —  Multi-Agent Orchestrator      ║"
+echo "║                                                      ║"
+echo "╚══════════════════════════════════════════════════════╝"
+printf "${RST}\n"
+
+log "task: ${BOLD}$TASK${RST}"
+log "cwd:  ${DIM}$CWD${RST}"
+
+# ── Load agents.json ─────────────────────────────────────────────────
+AVAILABLE_AGENTS=()
+
+if [[ -f "$AGENTS_JSON" ]]; then
+    while IFS= read -r name; do
+        AVAILABLE_AGENTS+=("$name")
+    done < <(jq -r '.[]' "$AGENTS_JSON" 2>/dev/null)
+    log "agents: ${BOLD}${AVAILABLE_AGENTS[*]}${RST}"
+else
+    err "agents.json not found at $AGENTS_JSON"
+    exit 1
+fi
+
+# ── Agent command builder ────────────────────────────────────────────
+# Internal knowledge: how to run each agent CLI.
+# Users never see this — they just list names in agents.json.
+build_agent_cmd() {
+    local agent="$1" prompt_file="$2"
+    case "$agent" in
+        claude-code)
+            # stdin prompt → interactive TUI with tool access
+            echo "claude --dangerously-skip-permissions < $(printf '%q' "$prompt_file")" ;;
+        codex)
+            echo "codex \"\$(cat $(printf '%q' "$prompt_file"))\"" ;;
+        gemini-cli)
+            echo "gemini -p \"\$(cat $(printf '%q' "$prompt_file"))\" -y" ;;
+        *)
+            # Unknown agent: try as command with stdin prompt
+            echo "$agent < $(printf '%q' "$prompt_file")" ;;
+    esac
 }
 
-# ── Agent registry ───────────────────────────────────────────────────
-# agents.json contains just a list of names: ["claude-code", "codex", "gemini-cli"]
-# Internal knowledge maps names → command, description, strengths for
-# auto-planning. The AI planner can override these assignments.
-
-AGENT_KNOWLEDGE = {
-    "claude-code": {
-        "commands": ["claude"],
-        "description": "Strong at UI, architecture, full-stack reasoning",
-        "strengths": ["frontend", "fullstack", "refactor", "debug", "docs", "test"],
-        "priority": 1,
-    },
-    "codex": {
-        "commands": ["codex"],
-        "description": "Strong at backend logic, algorithms, API design",
-        "strengths": ["backend", "logic", "algorithm", "api", "database", "test"],
-        "priority": 2,
-    },
-    "gemini-cli": {
-        "commands": ["gemini"],
-        "description": "Strong at code review, analysis, documentation",
-        "strengths": ["review", "analysis", "security", "docs", "test"],
-        "priority": 3,
-    },
+# ── cmux helpers ─────────────────────────────────────────────────────
+cmux_split() {
+    local direction="$1" surface="${2:-}"
+    local args="--json new-split"
+    [[ -n "$surface" ]] && args="$args --surface $surface"
+    args="$args $direction"
+    local out
+    out=$(cmux $args 2>/dev/null) || return 1
+    echo "$out" | jq -r '.surface_ref // .surface_id // empty' 2>/dev/null
 }
 
-
-def _load_agent_names() -> list[str]:
-    """Load available agent names from agents.json.
-
-    agents.json is just a JSON array of strings: ["claude-code", "codex", ...]
-    """
-    config_paths = [
-        Path(os.environ.get("CMUX_ORCHESTRATE_AGENTS", "")),
-        SCRIPT_DIR / "agents.json",
-        Path.home() / ".config" / "cmux-orchestrate" / "agents.json",
-    ]
-    for p in config_paths:
-        if p.is_file():
-            try:
-                data = json.loads(p.read_text())
-                if isinstance(data, list):
-                    log(f"agents.json: {data}", DIM)
-                    return data
-            except (json.JSONDecodeError, OSError):
-                continue
-    return []
-
-
-_AGENT_REGISTRY: list[dict] | None = None
-
-
-def get_agent_registry() -> list[dict]:
-    """Build registry from agents.json names + internal knowledge."""
-    global _AGENT_REGISTRY
-    if _AGENT_REGISTRY is None:
-        names = _load_agent_names()
-        _AGENT_REGISTRY = []
-        for name in names:
-            info = AGENT_KNOWLEDGE.get(name, {
-                "commands": [name],
-                "description": f"Agent: {name}",
-                "strengths": [],
-                "priority": 99,
-            })
-            _AGENT_REGISTRY.append({"name": name, **info})
-    return _AGENT_REGISTRY
-
-# Task keywords → roles mapping
-ROLE_KEYWORDS: dict[str, list[str]] = {
-    "frontend": ["ui", "frontend", "component", "page", "layout", "css", "style",
-                  "react", "vue", "svelte", "html", "form", "button", "dashboard",
-                  "responsive", "animation", "ux"],
-    "backend":  ["api", "backend", "server", "database", "endpoint", "auth",
-                  "rest", "graphql", "middleware", "model", "schema", "migration",
-                  "queue", "cache", "oauth", "login", "session"],
-    "review":   ["review", "audit", "security", "performance", "test", "quality",
-                  "refactor", "lint", "fix", "bug", "optimize"],
-    "test":     ["test", "spec", "coverage", "e2e", "unit test", "integration"],
-    "docs":     ["document", "readme", "changelog", "comment", "jsdoc", "docstring"],
-    "devops":   ["deploy", "ci", "cd", "docker", "kubernetes", "terraform", "infra"],
+cmux_send() {
+    local surface="$1" text="$2"
+    cmux send --surface "$surface" -- "${text}\\n" >/dev/null 2>&1
 }
 
+cmux_close() {
+    local surface="$1"
+    cmux close-surface --surface "$surface" >/dev/null 2>&1 || true
+}
 
-def detect_available_agents() -> list[dict]:
-    """Detect which agent CLIs are installed on the system."""
-    available = []
-    for agent in get_agent_registry():
-        for cmd in agent["commands"]:
-            if shutil.which(cmd):
-                available.append(agent)
-                break
-    return available
+# ── Wait for agent completion ────────────────────────────────────────
+# No timeout. Polls capture file size. Stops when stable for 30s.
+wait_for_completion() {
+    local capture="$1" role="$2"
+    local last_size=0 stall=0 elapsed=0
 
+    while true; do
+        sleep 5
+        elapsed=$((elapsed + 5))
+        local size
+        size=$(stat -f%z "$capture" 2>/dev/null || echo 0)
 
-def analyze_task_roles(task: str) -> list[str]:
-    """Analyze a task description and determine which roles are needed."""
-    task_lower = task.lower()
-    role_scores: dict[str, int] = {}
+        if [[ "$size" -gt "$last_size" ]]; then
+            stall=0
+            local delta=$((size - last_size))
+            log "  ${DIM}[$role] active (+${delta}B, ${elapsed}s)${RST}"
+            last_size=$size
+        else
+            stall=$((stall + 1))
+            # 30s (6 checks) of no activity → done
+            if [[ "$stall" -ge 6 ]]; then
+                log "  ${GRN}[$role] completed (${elapsed}s)${RST}"
+                return 0
+            fi
+        fi
+    done
+}
 
-    for role, keywords in ROLE_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in task_lower)
-        if score > 0:
-            role_scores[role] = score
+# ── AI Planning ──────────────────────────────────────────────────────
+# Ask main agent to decompose task into phased plan.
+# Returns JSON in PLAN_JSON variable, or empty on failure.
+PLAN_JSON=""
 
-    # Always include review if we have 2+ other roles
-    if not role_scores:
-        # Generic task: default to frontend + backend + review
-        return ["frontend", "backend", "review"]
+ai_plan() {
+    local agent_list
+    agent_list=$(printf '%s, ' "${AVAILABLE_AGENTS[@]}")
+    agent_list="${agent_list%, }"
 
-    roles = sorted(role_scores, key=lambda r: role_scores[r], reverse=True)
+    local prompt="You are the orchestrator for a multi-agent coding system.
 
-    # Cap at 4 roles max, ensure review is included for quality
-    if "review" not in roles:
-        roles.append("review")
-    return roles[:4]
-
-
-def assign_agents(roles: list[str], available: list[dict]) -> dict[str, str]:
-    """Assign the best available agent to each role."""
-    if not available:
-        # No agents found — fall back to mock
-        return {role: "mock" for role in roles}
-
-    assignments: dict[str, str] = {}
-    used_agents: set[str] = set()
-
-    for role in roles:
-        best_agent = None
-        best_score = -1
-
-        for agent in available:
-            # Score: how many of this agent's strengths match the role
-            score = 10 if role in agent["strengths"] else 0
-            # Prefer agents not yet assigned (diversity)
-            if agent["name"] not in used_agents:
-                score += 5
-            # Priority tiebreaker (lower = better)
-            score -= agent["priority"]
-
-            if score > best_score:
-                best_score = score
-                best_agent = agent
-
-        if best_agent:
-            assignments[role] = best_agent["name"]
-            used_agents.add(best_agent["name"])
-
-    return assignments
-
-
-def auto_plan(task: str) -> dict[str, str]:
-    """Full auto: detect agents, analyze task, assign roles."""
-    available = detect_available_agents()
-    roles = analyze_task_roles(task)
-    assignments = assign_agents(roles, available)
-    return assignments
-
-
-def print_auto_plan(task: str, available: list[dict], roles: list[str], assignments: dict[str, str]) -> None:
-    """Print the auto-planning decision."""
-    W = 62
-    print(f"\n{DIM}{'─' * W}{RESET}")
-    print(f"{BOLD}{CYAN}  AUTO-PLAN{RESET}")
-    print(f"{DIM}{'─' * W}{RESET}")
-
-    # Available agents
-    print(f"\n  {BOLD}Detected agents:{RESET}")
-    if available:
-        for agent in available:
-            print(f"    {GREEN}✓{RESET} {BOLD}{agent['name']}{RESET}  {DIM}— {agent['description']}{RESET}")
-    else:
-        print(f"    {YELLOW}(none found — using mock){RESET}")
-
-    not_found = [a for a in get_agent_registry() if a not in available]
-    for agent in not_found:
-        cmds = ", ".join(agent["commands"])
-        print(f"    {RED}✗{RESET} {DIM}{agent['name']}  ('{cmds}' not in PATH){RESET}")
-
-    # Task analysis
-    print(f"\n  {BOLD}Task analysis:{RESET}")
-    print(f"    \"{task}\"")
-    task_lower = task.lower()
-    matched_keywords: dict[str, list[str]] = {}
-    for role, keywords in ROLE_KEYWORDS.items():
-        hits = [kw for kw in keywords if kw in task_lower]
-        if hits:
-            matched_keywords[role] = hits
-    if matched_keywords:
-        for role, hits in matched_keywords.items():
-            print(f"    {DIM}→ {role}: matched [{', '.join(hits)}]{RESET}")
-    else:
-        print(f"    {DIM}→ no specific keywords matched, using default roles{RESET}")
-
-    # Assignments
-    print(f"\n  {BOLD}Role → Agent assignments:{RESET}")
-    for role, agent in assignments.items():
-        reason = ""
-        for a in get_agent_registry():
-            if a["name"] == agent and role in a["strengths"]:
-                reason = f"  {DIM}(strength match){RESET}"
-                break
-        print(f"    {BOLD}{role:<12s}{RESET} → {BOLD}{agent}{RESET}{reason}")
-
-    print(f"\n{DIM}{'─' * W}{RESET}\n")
-
-
-# ── AI-powered planning & synthesis (Main Agent = claude --print) ─────
-
-def _call_claude(prompt: str, timeout: float = 120) -> str | None:
-    """Call claude --print and return output. Returns None on failure."""
-    cmd = ["claude", "--print", "--output-format", "text", "-p", prompt]
-    master, slave = pty.openpty()
-    try:
-        proc = subprocess.Popen(
-            cmd, stdout=slave, stderr=slave, stdin=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        os.close(master)
-        os.close(slave)
-        return None
-    os.close(slave)
-
-    chunks: list[bytes] = []
-    deadline = time.time() + timeout
-    while proc.poll() is None:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            proc.kill()
-            proc.wait()
-            os.close(master)
-            return None
-        r, _, _ = select.select([master], [], [], min(remaining, 0.5))
-        if r:
-            try:
-                chunks.append(os.read(master, 8192))
-            except OSError:
-                break
-    # Drain
-    while True:
-        r, _, _ = select.select([master], [], [], 0.1)
-        if not r:
-            break
-        try:
-            data = os.read(master, 8192)
-            if not data:
-                break
-            chunks.append(data)
-        except OSError:
-            break
-    os.close(master)
-
-    if proc.returncode != 0:
-        return None
-    text = b"".join(chunks).decode(errors="replace")
-    text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
-    text = re.sub(r"\x1b\].*?\x07", "", text)
-    return text.strip()
-
-
-def _extract_json(text: str) -> dict | None:
-    """Extract a JSON object from text that may contain markdown fences."""
-    # Try direct parse
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # Try extracting from ```json ... ``` block
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    # Try finding first { ... } block
-    depth = 0
-    start = None
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start is not None:
-                try:
-                    return json.loads(text[start : i + 1])
-                except json.JSONDecodeError:
-                    start = None
-    return None
-
-
-def ai_plan_task(task: str, available_agents: list[dict]) -> dict | None:
-    """Use claude as main agent to decompose task into phased plan.
-
-    Returns dict like:
-      {
-        "phases": [
-          {
-            "name": "implement",
-            "tasks": [
-              {"role": "backend-auth", "agent": "codex", "prompt": "..."},
-              {"role": "frontend", "agent": "claude-code", "prompt": "..."}
-            ]
-          },
-          {
-            "name": "review",
-            "tasks": [
-              {"role": "review", "agent": "gemini-cli", "prompt": "..."}
-            ]
-          }
-        ]
-      }
-    Or None if AI planning fails.
-    """
-    agent_names = [a["name"] for a in available_agents]
-
-    prompt = f"""You are the orchestrator for a multi-agent coding system.
-
-AVAILABLE AGENTS: {", ".join(agent_names)}
+AVAILABLE AGENTS: ${agent_list}
 
 You know each agent's capabilities. Assign the best agent for each sub-task.
 
 TASK:
-{task}
+${TASK}
 
-Decompose this task into PHASES. Within each phase, tasks run in parallel. Phases run sequentially — later phases can depend on earlier phase results.
+Decompose this task into PHASES. Within each phase, tasks run in parallel. Phases run sequentially.
 
 Rules:
-- Choose only from the available agents listed above. You may assign the same agent to multiple tasks.
-- Each role name should be a short, unique lowercase identifier (e.g., backend-auth, backend-db, frontend-ui, review).
-- The last phase should always be "review" — it reviews all prior phase outputs.
-- Write prompts that are specific to THIS task, not generic templates.
-- Review prompts should reference what the earlier phases are doing.
+- Choose only from the available agents listed above.
+- Each role name should be a short unique lowercase identifier (e.g., backend-auth, frontend-ui, review).
+- The last phase should always be \"review\".
+- Write prompts that are specific to THIS task. Tell agents to use sensible defaults and NOT ask clarifying questions.
+- Tell agents to create real files in the current working directory.
 - Max 6 tasks total across all phases.
 
-Respond with ONLY a JSON object (no markdown, no explanation):
-{{"phases": [{{"name": "...", "tasks": [{{"role": "...", "agent": "...", "prompt": "..."}}]}}]}}"""
-
-    log("main agent (claude) analyzing task...", CYAN)
-    start = time.time()
-    result = _call_claude(prompt, timeout=120)
-    elapsed = time.time() - start
-
-    if not result:
-        log(f"main agent failed ({elapsed:.1f}s) — falling back to keyword plan", RED)
-        return None
-
-    log(f"main agent responded ({elapsed:.1f}s)", GREEN)
-    parsed = _extract_json(result)
-    if not parsed or "phases" not in parsed:
-        # Try legacy "roles" format and auto-wrap in phases
-        if parsed and "roles" in parsed:
-            impl_tasks = [t for t in parsed["roles"] if t.get("role") != "review"]
-            review_tasks = [t for t in parsed["roles"] if t.get("role") == "review"]
-            parsed = {"phases": []}
-            if impl_tasks:
-                parsed["phases"].append({"name": "implement", "tasks": impl_tasks})
-            if review_tasks:
-                parsed["phases"].append({"name": "review", "tasks": review_tasks})
-        else:
-            log(f"main agent returned invalid JSON — falling back", RED)
-            log(f"  raw: {result[:200]}", DIM)
-            return None
-
-    return parsed
-
-
-def ai_synthesize(task: str, results: dict[str, str], agents: dict[str, str]) -> str | None:
-    """Use claude to synthesize all agent results into a unified analysis."""
-    results_text = ""
-    for role, output in results.items():
-        agent = agents.get(role, "unknown")
-        truncated = output[:3000]
-        results_text += f"\n--- {role} ({agent}) ---\n{truncated}\n"
-
-    prompt = f"""You are reviewing the outputs of a multi-agent coding task.
-
-ORIGINAL TASK: {task}
-
-AGENT RESULTS:
-{results_text}
-
-Analyze the combined results and provide:
-1. **Summary**: What was accomplished by each agent (1-2 sentences each)
-2. **Integration issues**: Do the outputs conflict? (e.g., mismatched API contracts, incompatible assumptions)
-3. **Gaps**: What's missing that no agent addressed?
-4. **Verdict**: Is the task complete, partially complete, or failed?
-
-Be specific and concise."""
-
-    log("main agent synthesizing results...", CYAN)
-    start = time.time()
-    result = _call_claude(prompt, timeout=120)
-    elapsed = time.time() - start
-
-    if not result:
-        log(f"synthesis failed ({elapsed:.1f}s)", RED)
-        return None
-
-    log(f"synthesis complete ({elapsed:.1f}s)", GREEN)
-    return result
-
-
-def log(msg: str, color: str = DIM) -> None:
-    ts = time.strftime("%H:%M:%S")
-    print(
-        f"{DIM}{ts}{RESET} {BOLD}{MAGENTA}[orchestrate]{RESET} {color}{msg}{RESET}",
-        flush=True,
-    )
-
-
-def banner() -> None:
-    print(f"""
-{BOLD}{MAGENTA}╔══════════════════════════════════════════════════════╗
-║                                                      ║
-║   {CYAN}cmux orchestrate{MAGENTA}  —  Multi-Agent Orchestrator     ║
-║                                                      ║
-║   Spawn specialized AI agents in cmux split panes    ║
-║   and coordinate them via lightweight IPC.            ║
-║                                                      ║
-╚══════════════════════════════════════════════════════╝{RESET}
-""", flush=True)
-
-
-# ── cmux CLI helpers ─────────────────────────────────────────────────
-
-def cmux(*args: str, json_output: bool = False) -> str:
-    """Run a cmux CLI command and return stdout."""
-    cmd = ["cmux"]
-    if json_output:
-        cmd.append("--json")
-    cmd.extend(args)
-    log(f"$ {' '.join(cmd)}", DIM)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-    if result.returncode != 0:
-        err = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(f"cmux command failed: {' '.join(args)}\n{err}")
-    return result.stdout.strip()
-
-
-def cmux_split(direction: str = "right", surface: str | None = None) -> str:
-    """Split a pane and return the new surface ref."""
-    args = ["new-split"]
-    if surface:
-        args.extend(["--surface", surface])
-    args.append(direction)
-    output = cmux(*args, json_output=True)
-    try:
-        data = json.loads(output)
-        if "result" in data and isinstance(data["result"], dict):
-            data = data["result"]
-        surface_id = (
-            data.get("surface_ref")
-            or data.get("surface_id")
-            or data.get("created_surface_ref")
-            or data.get("created_surface_id")
-            or data.get("created_tab_ref")
-            or data.get("created_tab_id")
-            or ""
-        )
-        if not surface_id:
-            log(f"  [debug] split response keys: {list(data.keys())}", DIM)
-        return surface_id
-    except json.JSONDecodeError:
-        if output.startswith("OK "):
-            return output.split()[-1]
-        log(f"  [debug] raw split output: {output[:200]}", DIM)
-        return ""
-
-
-def cmux_send(text: str, surface: str | None = None) -> None:
-    """Send text to a cmux surface."""
-    args = ["send"]
-    if surface:
-        args.extend(["--surface", surface])
-    args.append("--")
-    args.append(text + "\\n")
-    cmux(*args)
-
-
-def cmux_close_surface(surface: str) -> None:
-    """Close a cmux surface/pane."""
-    try:
-        cmux("close-surface", "--surface", surface)
-    except RuntimeError:
-        pass  # Already closed or invalid
-
-
-def cmux_list_panes() -> list[dict]:
-    """List current panes."""
-    output = cmux("list-panes", json_output=True)
-    try:
-        data = json.loads(output)
-        return data.get("panes", [])
-    except json.JSONDecodeError:
-        return []
-
-
-# ── Process management ───────────────────────────────────────────────
-
-class OrchestrateSession:
-    def __init__(
-        self,
-        task: str,
-        agents: dict[str, str],
-        cwd: str | None = None,
-    ) -> None:
-        self.task = task
-        self.agents = agents  # role -> agent_cli
-        self.cwd = cwd or os.getcwd()
-        self.broker_proc: subprocess.Popen | None = None
-        self.surface_ids: dict[str, str] = {}  # role -> surface ref
-        self._results: dict[str, str] = {}
-        self._result_agents: dict[str, str] = {}  # role -> agent that produced result
-        self._result_times: dict[str, float] = {}  # role -> elapsed seconds
-        self._dispatched_prompts: dict[str, str] = {}  # role -> prompt sent
-        self._dispatch_time: float = 0.0
-        self._ai_prompts: dict[str, str] = {}  # AI-generated prompts (if available)
-        self._snapshots: dict[str, str] = {}  # progress snapshots from workers
-        self._synthesis: str | None = None  # AI synthesis of results
-        self._phases: list[dict] | None = None  # phased execution plan
-
-    def start_broker(self) -> None:
-        """Launch the IPC broker as a background process."""
-        log("starting IPC broker...", CYAN)
-        env = os.environ.copy()
-        env["CMUX_ORCHESTRATE_SOCK"] = SOCKET_PATH
-        self.broker_proc = subprocess.Popen(
-            [sys.executable, str(SCRIPT_DIR / "broker.py")],
-            env=env,
-            # Let broker output go to its own pane (or current terminal)
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        # Wait for socket to appear
-        sock_path = Path(SOCKET_PATH)
-        for _ in range(30):
-            if sock_path.exists():
-                log("broker ready", GREEN)
-                return
-            time.sleep(0.2)
-        raise RuntimeError("Broker failed to start within 6 seconds")
-
-    def create_panes(self) -> None:
-        """Split cmux into panes for each agent role.
-
-        Layout strategy:
-          ┌──────────────┬──────────────┐
-          │              │  agent 1     │
-          │ orchestrator │──────────────│
-          │   (current)  │  agent 2     │
-          │              │──────────────│
-          │              │  agent 3     │
-          └──────────────┴──────────────┘
-
-        1st agent: split RIGHT from orchestrator → creates right column
-        2nd+ agents: split DOWN from the last created surface → stack vertically
-        """
-        roles = list(self.agents.keys())
-        log(f"creating {len(roles)} agent panes: {', '.join(roles)}", CYAN)
-
-        last_surface: str | None = None  # track last created surface for chaining
-
-        for i, role in enumerate(roles):
-            try:
-                before = {self._pane_surface(p) for p in cmux_list_panes()}
-
-                if i == 0:
-                    # First agent: split right from orchestrator
-                    surface = cmux_split("right")
-                else:
-                    # Subsequent agents: split down from the last created surface
-                    surface = cmux_split("down", surface=last_surface)
-
-                # Fallback: diff pane lists
-                if not surface:
-                    time.sleep(0.3)
-                    after = {self._pane_surface(p) for p in cmux_list_panes()}
-                    new_surfaces = after - before
-                    if new_surfaces:
-                        surface = new_surfaces.pop()
-                        log(f"  (resolved via pane diff)", DIM)
-
-                self.surface_ids[role] = surface
-                if surface:
-                    last_surface = surface
-                log(f"  pane for '{role}' → {surface or '(FAILED)'}", GREEN if surface else RED)
-                time.sleep(0.3)
-            except RuntimeError as e:
-                log(f"  failed to create pane for '{role}': {e}", RED)
-                self.surface_ids[role] = ""
-
-    @staticmethod
-    def _pane_surface(pane: dict) -> str:
-        """Extract surface ref/id from a pane dict."""
-        # pane.list returns surfaces as nested list or direct fields
-        surfaces = pane.get("surfaces", [])
-        if surfaces and isinstance(surfaces, list):
-            s = surfaces[0] if surfaces else {}
-            return s.get("ref") or s.get("id") or ""
-        return pane.get("surface_ref") or pane.get("surface_id") or pane.get("ref") or pane.get("id") or ""
-
-    def launch_workers(self) -> None:
-        """Send worker launch commands into each pane."""
-        log("launching agent workers...", CYAN)
-        worker_script = str(SCRIPT_DIR / "agent_worker.py")
-
-        for role, agent_cli in self.agents.items():
-            surface = self.surface_ids.get(role)
-            cmd = (
-                f"python3 {worker_script} "
-                f"--role {role} "
-                f"--agent {agent_cli} "
-                f"--socket {SOCKET_PATH} "
-                f"--cwd {shlex.quote(self.cwd)}"
-            )
-            log(f"  [{role}] {agent_cli} → {surface or 'current'}", GREEN)
-            try:
-                cmux_send(cmd, surface=surface if surface else None)
-            except RuntimeError as e:
-                log(f"  failed to launch worker '{role}': {e}", RED)
-
-    def _create_phase_panes(self, phase_tasks: list[dict]) -> None:
-        """Create split panes for a single phase's tasks."""
-        roles = [t["role"] for t in phase_tasks]
-        log(f"creating {len(roles)} panes: {', '.join(roles)}", CYAN)
-
-        last_surface: str | None = None
-        for i, task_entry in enumerate(phase_tasks):
-            role = task_entry["role"]
-            try:
-                before = {self._pane_surface(p) for p in cmux_list_panes()}
-                if i == 0:
-                    surface = cmux_split("right")
-                else:
-                    surface = cmux_split("down", surface=last_surface)
-
-                if not surface:
-                    time.sleep(0.3)
-                    after = {self._pane_surface(p) for p in cmux_list_panes()}
-                    new_surfaces = after - before
-                    if new_surfaces:
-                        surface = new_surfaces.pop()
-
-                self.surface_ids[role] = surface
-                if surface:
-                    last_surface = surface
-                log(f"  {role} → {surface or '(FAILED)'}", GREEN if surface else RED)
-                time.sleep(0.3)
-            except RuntimeError as e:
-                log(f"  failed: {role}: {e}", RED)
-                self.surface_ids[role] = ""
-
-    def _launch_phase_workers(self, phase_tasks: list[dict]) -> None:
-        """Launch agent workers for a single phase."""
-        worker_script = str(SCRIPT_DIR / "agent_worker.py")
-        for task_entry in phase_tasks:
-            role = task_entry["role"]
-            agent_cli = task_entry["agent"]
-            surface = self.surface_ids.get(role)
-            cmd = (
-                f"python3 {worker_script} "
-                f"--role {role} "
-                f"--agent {agent_cli} "
-                f"--socket {SOCKET_PATH} "
-                f"--cwd {shlex.quote(self.cwd)}"
-            )
-            log(f"  [{role}] {agent_cli} �� {surface or 'current'}", GREEN)
-            try:
-                cmux_send(cmd, surface=surface if surface else None)
-            except RuntimeError as e:
-                log(f"  failed to launch '{role}': {e}", RED)
-
-    def _close_phase_panes(self, phase_tasks: list[dict]) -> None:
-        """Close panes for completed phase tasks."""
-        for task_entry in phase_tasks:
-            role = task_entry["role"]
-            surface = self.surface_ids.get(role)
-            if surface:
-                log(f"  closing {role} ({surface})", DIM)
-                cmux_close_surface(surface)
-                del self.surface_ids[role]
-
-    async def run_phased(self) -> None:
-        """Execute phases sequentially, tasks within each phase in parallel."""
-        phases = self._phases or [{"name": "run", "tasks": [
-            {"role": r, "agent": a, "prompt": self._ai_prompts.get(r, "")}
-            for r, a in self.agents.items()
-        ]}]
-
-        # Connect to broker
-        for attempt in range(15):
-            try:
-                reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
-                break
-            except (FileNotFoundError, ConnectionRefusedError):
-                await asyncio.sleep(0.5)
-        else:
-            raise ConnectionError("Could not connect to broker")
-
-        writer.write(
-            (json.dumps({"type": "register", "role": "orchestrator"}) + "\n").encode()
-        )
-        await writer.drain()
-        await reader.readline()
-        log("connected to broker as orchestrator", GREEN)
-
-        total_phases = len(phases)
-
-        for phase_idx, phase in enumerate(phases):
-            phase_name = phase.get("name", f"phase-{phase_idx + 1}")
-            phase_tasks = phase.get("tasks", [])
-            if not phase_tasks:
-                continue
-
-            W = 62
-            print(f"\n{BOLD}{CYAN}{'━' * W}{RESET}")
-            print(f"{BOLD}{CYAN}  PHASE {phase_idx + 1}/{total_phases}: {phase_name.upper()}{RESET}")
-            print(f"{BOLD}{CYAN}{'━' * W}{RESET}")
-
-            phase_roles = [t["role"] for t in phase_tasks]
-
-            # Inject previous phase results + project state into later phases
-            if phase_idx > 0 and self._results:
-                context = "\n\n--- CONTEXT FROM PREVIOUS PHASES ---\n"
-                for r, v in self._results.items():
-                    if not v.startswith("[ERROR]"):
-                        context += f"\n[{r}] output:\n{v[:5000]}\n"
-
-                # Include current project file listing
-                try:
-                    file_list = subprocess.run(
-                        ["find", self.cwd, "-type", "f", "-maxdepth", "4",
-                         "-not", "-path", "*/node_modules/*",
-                         "-not", "-path", "*/.git/*",
-                         "-not", "-path", "*/__pycache__/*"],
-                        capture_output=True, text=True, timeout=5
-                    ).stdout.strip()
-                    if file_list:
-                        context += f"\n[project files in {self.cwd}]:\n{file_list}\n"
-                except Exception:
-                    pass
-
-                for t in phase_tasks:
-                    t["prompt"] = t.get("prompt", "") + context
-
-            # Update agents map for this phase
-            for t in phase_tasks:
-                self.agents[t["role"]] = t["agent"]
-                # Only set AI prompts if non-empty (empty → falls through to templates)
-                if t.get("prompt"):
-                    self._ai_prompts[t["role"]] = t["prompt"]
-
-            # Create panes and launch workers
-            self._create_phase_panes(phase_tasks)
-            self._launch_phase_workers(phase_tasks)
-
-            # Wait for workers to register
-            log(f"waiting for phase workers: {', '.join(phase_roles)}...", YELLOW)
-            writer.write(
-                (json.dumps({"type": "wait_ready", "roles": phase_roles}) + "\n").encode()
-            )
-            await writer.drain()
-            try:
-                ready_line = await asyncio.wait_for(reader.readline(), timeout=30)
-                ready_msg = json.loads(ready_line.decode().strip())
-                if ready_msg.get("type") == "ready":
-                    log("workers ready", GREEN)
-            except asyncio.TimeoutError:
-                log("timeout waiting for workers — proceeding", YELLOW)
-
-            # Dispatch
-            dispatch_time = time.time()
-            prompts = self._decompose_task()
-
-            for t in phase_tasks:
-                role = t["role"]
-                agent_cli = t["agent"]
-                prompt = prompts.get(role, t.get("prompt", ""))
-                self._dispatched_prompts[role] = prompt
-                msg = {
-                    "type": "task",
-                    "from": "orchestrator",
-                    "to": role,
-                    "payload": prompt,
-                }
-                log(f"  dispatch → {BOLD}{role}{RESET} via {BOLD}{agent_cli}{RESET}", CYAN)
-                writer.write((json.dumps(msg) + "\n").encode())
-                await writer.drain()
-
-            # Collect results for this phase (no timeout — wait for natural exit)
-            pending = set(phase_roles)
-            log(f"waiting for {len(pending)} results (no timeout)...", YELLOW)
-
-            while pending:
-                line = await reader.readline()
-                if not line:
-                    log("broker connection lost", RED)
-                    break
-                msg = json.loads(line.decode().strip())
-
-                if msg.get("type") == "result":
-                    from_role = msg.get("from", "?")
-                    if from_role not in pending:
-                        continue
-                    from_agent = msg.get("agent", self.agents.get(from_role, "?"))
-                    payload = msg.get("payload", "")
-                    elapsed = time.time() - dispatch_time
-
-                    self._results[from_role] = payload
-                    self._result_agents[from_role] = from_agent
-                    self._result_times[from_role] = elapsed
-                    pending.discard(from_role)
-
-                    log(
-                        f"  result from {BOLD}{from_role}{RESET} "
-                        f"({BOLD}{from_agent}{RESET}, {elapsed:.1f}s) "
-                        f"— {len(pending)} remaining",
-                        GREEN,
-                    )
-                    snippet = payload[:120].replace("\n", " ")
-                    log(f"    └─ {snippet}{'...' if len(payload) > 120 else ''}", DIM)
-
-                elif msg.get("type") == "progress":
-                    from_role = msg.get("from", "?")
-                    snapshot = msg.get("snapshot", "")
-                    self._snapshots[from_role] = snapshot
-                    elapsed = time.time() - dispatch_time
-                    log(f"  progress from {from_role} ({elapsed:.0f}s, {len(snapshot)} chars)", DIM)
-
-            # Close completed panes
-            log(f"phase '{phase_name}' complete — closing panes", GREEN)
-            self._close_phase_panes(phase_tasks)
-
-        # Shutdown broker connection
-        writer.write((json.dumps({"type": "shutdown"}) + "\n").encode())
-        await writer.drain()
-        writer.close()
-
-    # Legacy single-phase dispatch (for --mock and --agents mode)
-    async def connect_and_dispatch(self) -> None:
-        """Single-phase execution (backward compat)."""
-        self._phases = [{"name": "run", "tasks": [
-            {"role": r, "agent": a, "prompt": self._ai_prompts.get(r, "")}
-            for r, a in self.agents.items()
-        ]}]
-        await self.run_phased()
-
-    def _decompose_task(self) -> dict[str, str]:
-        """Decompose the main task into sub-tasks for each role.
-
-        Uses AI-generated prompts if available, falls back to templates.
-        """
-        # If main agent provided specific prompts, use them
-        if self._ai_prompts and any(self._ai_prompts.values()):
-            prompts = {}
-            for role in self.agents:
-                if role in self._ai_prompts:
-                    prompts[role] = self._ai_prompts[role]
-                else:
-                    prompts[role] = (
-                        f"You are the {role} specialist. "
-                        f"Handle the {role}-related parts of this task:\n\n"
-                        f"Task: {self.task}"
-                    )
-            return prompts
-
-        # Fallback: static templates with directive instructions
-        prompts: dict[str, str] = {}
-        directive = (
-            "IMPORTANT: Do NOT ask clarifying questions. Use sensible defaults "
-            "and start building immediately. Create real files in the current "
-            "working directory. Pick a reasonable tech stack and implement."
-        )
-        templates = {
-            "frontend": f"You are the frontend specialist. Implement the UI/frontend parts of this task.\n\nTask: {{task}}\n\nFocus on: components, layout, styling, user interactions.\n\n{directive}",
-            "backend": f"You are the backend specialist. Implement the backend/logic parts of this task.\n\nTask: {{task}}\n\nFocus on: API endpoints, data models, business logic, database.\n\n{directive}",
-            "review": "You are the code reviewer. Review ALL files in the current working directory for the following task:\n\nTask: {task}\n\nFocus on: correctness, security, performance, best practices. List specific issues found.",
-            "test": f"You are the test engineer. Write tests for this task.\n\nTask: {{task}}\n\nFocus on: unit tests, edge cases, coverage.\n\n{directive}",
-            "docs": f"You are the documentation specialist. Write documentation for this task.\n\nTask: {{task}}\n\nFocus on: README, API docs, setup instructions.\n\n{directive}",
-            "devops": f"You are the DevOps specialist. Set up infrastructure for this task.\n\nTask: {{task}}\n\nFocus on: Dockerfile, CI/CD, deployment config.\n\n{directive}",
+Respond with ONLY a JSON object:
+{\"phases\": [{\"name\": \"...\", \"tasks\": [{\"role\": \"...\", \"agent\": \"...\", \"prompt\": \"...\"}]}]}"
+
+    log "${CYN}main agent analyzing task...${RST}"
+    local start=$SECONDS
+    local result
+    result=$(claude --print -p "$prompt" 2>/dev/null) || { err "main agent failed"; return 1; }
+    local elapsed=$((SECONDS - start))
+    log "${GRN}main agent responded (${elapsed}s)${RST}"
+
+    # Extract JSON from response
+    PLAN_JSON=$(echo "$result" | sed -n '/^{/,/^}/p' | head -100)
+    if ! echo "$PLAN_JSON" | jq . >/dev/null 2>&1; then
+        # Try extracting from markdown code block
+        PLAN_JSON=$(echo "$result" | sed -n '/```json/,/```/p' | sed '1d;$d')
+        if ! echo "$PLAN_JSON" | jq . >/dev/null 2>&1; then
+            err "failed to parse AI plan"
+            PLAN_JSON=""
+            return 1
+        fi
+    fi
+}
+
+# ── Keyword Fallback ─────────────────────────────────────────────────
+# When AI planner fails. Determines roles from keywords,
+# assigns agents from agents.json (round-robin, NOT hardcoded).
+keyword_fallback() {
+    local task_lower
+    task_lower=$(echo "$TASK" | tr '[:upper:]' '[:lower:]')
+
+    local roles=()
+    echo "$task_lower" | grep -qE 'ui|page|dashboard|frontend|component|react|vue|css|html' && roles+=("frontend")
+    echo "$task_lower" | grep -qE 'api|backend|server|database|endpoint|auth|rest|graphql|login|oauth' && roles+=("backend")
+    echo "$task_lower" | grep -qE 'test|spec|coverage|e2e|unit' && roles+=("test")
+    echo "$task_lower" | grep -qE 'deploy|ci|cd|docker|kubernetes|terraform' && roles+=("devops")
+    echo "$task_lower" | grep -qE 'document|readme|changelog' && roles+=("docs")
+
+    # Default if no keywords matched
+    [[ ${#roles[@]} -eq 0 ]] && roles=("frontend" "backend")
+
+    # Always add review
+    roles+=("review")
+
+    # Assign agents from available list (round-robin)
+    local num_agents=${#AVAILABLE_AGENTS[@]}
+    local impl_tasks="" review_tasks=""
+    local i=0
+
+    for role in "${roles[@]}"; do
+        local agent="${AVAILABLE_AGENTS[$((i % num_agents))]}"
+        local prompt
+        case "$role" in
+            frontend) prompt="You are the frontend specialist. Implement the UI/frontend parts of this task.\n\nTask: ${TASK}\n\nIMPORTANT: Do NOT ask clarifying questions. Use sensible defaults and start building immediately. Create real files in the current working directory." ;;
+            backend)  prompt="You are the backend specialist. Implement the backend/logic parts of this task.\n\nTask: ${TASK}\n\nIMPORTANT: Do NOT ask clarifying questions. Use sensible defaults and start building immediately. Create real files in the current working directory." ;;
+            review)   prompt="You are the code reviewer. Review ALL files in the current working directory.\n\nTask: ${TASK}\n\nList specific issues found with file paths and line numbers." ;;
+            test)     prompt="You are the test engineer. Write tests for this task.\n\nTask: ${TASK}\n\nCreate real test files in the current working directory." ;;
+            devops)   prompt="You are the DevOps specialist. Set up infrastructure.\n\nTask: ${TASK}\n\nCreate Dockerfile, CI config, etc. in the current working directory." ;;
+            docs)     prompt="You are the documentation specialist. Write documentation.\n\nTask: ${TASK}\n\nCreate README and docs in the current working directory." ;;
+            *)        prompt="Handle the ${role} parts of: ${TASK}" ;;
+        esac
+
+        local entry
+        entry=$(jq -n --arg r "$role" --arg a "$agent" --arg p "$prompt" \
+            '{role: $r, agent: $a, prompt: $p}')
+
+        if [[ "$role" == "review" ]]; then
+            review_tasks="${review_tasks}${review_tasks:+,}${entry}"
+        else
+            impl_tasks="${impl_tasks}${impl_tasks:+,}${entry}"
+            i=$((i + 1))
+        fi
+    done
+
+    # Build phased plan: implement → review
+    PLAN_JSON="{\"phases\":["
+    [[ -n "$impl_tasks" ]] && PLAN_JSON="${PLAN_JSON}{\"name\":\"implement\",\"tasks\":[${impl_tasks}]},"
+    [[ -n "$review_tasks" ]] && PLAN_JSON="${PLAN_JSON}{\"name\":\"review\",\"tasks\":[${review_tasks}]}"
+    PLAN_JSON="${PLAN_JSON}]}"
+
+    log "${YLW}keyword fallback plan:${RST}"
+    echo "$PLAN_JSON" | jq -r '.phases[] | "  Phase: \(.name) → \([.tasks[].role] | join(", "))"'
+}
+
+# ���─ Mock agent ───────────────────────────────────────────────────────
+run_mock_phase() {
+    local phase_json="$1"
+    local num_tasks
+    num_tasks=$(echo "$phase_json" | jq '.tasks | length')
+
+    for ((i=0; i<num_tasks; i++)); do
+        local role agent prompt
+        role=$(echo "$phase_json" | jq -r ".tasks[$i].role")
+        agent=$(echo "$phase_json" | jq -r ".tasks[$i].agent")
+        log "  ${DIM}[mock] $role ($agent): processing...${RST}"
+        sleep 2
+        echo "[${role}] Mock completed. Generated ${role} component." > "$CAPTURE_DIR/capture-${role}.log"
+        log "  ${GRN}[mock] $role done${RST}"
+    done
+}
+
+# ── Run a phase ──────────────────────────────────────────────────────
+run_phase() {
+    local phase_json="$1" phase_idx="$2" total_phases="$3" prev_context="$4"
+    local phase_name
+    phase_name=$(echo "$phase_json" | jq -r '.name')
+    local num_tasks
+    num_tasks=$(echo "$phase_json" | jq '.tasks | length')
+
+    printf "\n${BOLD}${CYN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}\n"
+    printf "${BOLD}${CYN}  PHASE %d/%d: %s${RST}\n" "$phase_idx" "$total_phases" "$(echo "$phase_name" | tr '[:lower:]' '[:upper:]')"
+    printf "${BOLD}${CYN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}\n"
+
+    # Mock mode
+    if $MOCK; then
+        run_mock_phase "$phase_json"
+        return 0
+    fi
+
+    local surface_ids=()
+    local roles=()
+    local last_surface=""
+
+    # Create panes
+    log "creating $num_tasks panes..."
+    for ((i=0; i<num_tasks; i++)); do
+        local role
+        role=$(echo "$phase_json" | jq -r ".tasks[$i].role")
+        roles+=("$role")
+
+        local sid
+        if [[ $i -eq 0 ]]; then
+            sid=$(cmux_split "right") || sid=""
+        else
+            sid=$(cmux_split "down" "$last_surface") || sid=""
+        fi
+
+        surface_ids+=("$sid")
+        [[ -n "$sid" ]] && last_surface="$sid"
+        log "  $role → ${sid:-FAILED}"
+        sleep 0.3
+    done
+
+    # Launch agents in panes
+    log "launching agents..."
+    for ((i=0; i<num_tasks; i++)); do
+        local role agent prompt sid
+        role=$(echo "$phase_json" | jq -r ".tasks[$i].role")
+        agent=$(echo "$phase_json" | jq -r ".tasks[$i].agent")
+        prompt=$(echo "$phase_json" | jq -r ".tasks[$i].prompt")
+        sid="${surface_ids[$i]}"
+
+        # Append previous phase context
+        if [[ -n "$prev_context" ]]; then
+            prompt="${prompt}
+
+--- CONTEXT FROM PREVIOUS PHASES ---
+${prev_context}"
+        fi
+
+        # Write prompt to file (agents read from this)
+        local prompt_file="$CAPTURE_DIR/prompt-${role}.txt"
+        printf '%s' "$prompt" > "$prompt_file"
+
+        local capture="$CAPTURE_DIR/capture-${role}.log"
+        local agent_cmd
+        agent_cmd=$(build_agent_cmd "$agent" "$prompt_file")
+
+        log "  ${BOLD}[$role]${RST} $agent → $sid"
+
+        if [[ -n "$sid" ]]; then
+            cmux_send "$sid" "cd $(printf '%q' "$CWD") && script -q $(printf '%q' "$capture") bash -c $(printf '%q' "$agent_cmd")"
+        fi
+    done
+
+    # Wait for all agents to complete
+    log "waiting for agents (no timeout)..."
+    for ((i=0; i<num_tasks; i++)); do
+        local role="${roles[$i]}"
+        local capture="$CAPTURE_DIR/capture-${role}.log"
+
+        # Wait for capture file to appear
+        local wait=0
+        while [[ ! -f "$capture" ]] && [[ $wait -lt 30 ]]; do
+            sleep 1; wait=$((wait + 1))
+        done
+
+        wait_for_completion "$capture" "$role" &
+    done
+    wait  # Wait for all background wait_for_completion jobs
+
+    # Collect results
+    log "${GRN}all agents completed${RST}"
+
+    # Close panes
+    for ((i=0; i<num_tasks; i++)); do
+        local sid="${surface_ids[$i]}"
+        [[ -n "$sid" ]] && cmux_close "$sid"
+    done
+    log "panes closed"
+}
+
+# ── Collect context from phase results ───────────────────────────────
+collect_context() {
+    local context=""
+    for f in "$CAPTURE_DIR"/capture-*.log; do
+        [[ -f "$f" ]] || continue
+        local role
+        role=$(basename "$f" .log | sed 's/capture-//')
+        local content
+        content=$(cat "$f" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tail -c 5000)
+        context="${context}
+[$role] output:
+${content}
+"
+    done
+
+    # Add project file listing
+    local files
+    files=$(find "$CWD" -type f -maxdepth 4 \
+        -not -path "*/node_modules/*" \
+        -not -path "*/.git/*" \
+        -not -path "*/__pycache__/*" 2>/dev/null | head -50)
+    if [[ -n "$files" ]]; then
+        context="${context}
+[project files in $CWD]:
+${files}
+"
+    fi
+
+    echo "$context"
+}
+
+# ── Print report ─────────────────────────────────────────────────────
+print_report() {
+    local W=62
+    printf "\n${BOLD}$( printf '═%.0s' $(seq 1 $W) )${RST}\n"
+    printf "${BOLD}${MAG}  ORCHESTRATION REPORT${RST}\n"
+    printf "${BOLD}$( printf '═%.0s' $(seq 1 $W) )${RST}\n\n"
+
+    printf "  ${BOLD}Task:${RST}  %s\n" "$TASK"
+    printf "  ${BOLD}CWD:${RST}   %s\n\n" "$CWD"
+
+    for f in "$CAPTURE_DIR"/capture-*.log; do
+        [[ -f "$f" ]] || continue
+        local role
+        role=$(basename "$f" .log | sed 's/capture-//')
+        local size
+        size=$(stat -f%z "$f" 2>/dev/null || echo 0)
+        local snippet
+        snippet=$(cat "$f" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | tail -5 | head -3)
+
+        printf "  ${BOLD}${CYN}── %s (%s chars) ──${RST}\n" "$role" "$size"
+        echo "$snippet" | while IFS= read -r line; do
+            printf "  │ %s\n" "$line"
+        done
+        echo ""
+    done
+
+    # Project files created
+    local files
+    files=$(find "$CWD" -type f -maxdepth 3 \
+        -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -20)
+    if [[ -n "$files" ]]; then
+        printf "  ${BOLD}${GRN}── Files Created ──${RST}\n"
+        echo "$files" | while IFS= read -r f; do
+            printf "  │ %s\n" "$f"
+        done
+        echo ""
+    fi
+
+    printf "${BOLD}$( printf '═%.0s' $(seq 1 $W) )${RST}\n\n"
+}
+
+# ── Main ─────────────────────────────────────────────────────────────
+main() {
+    # Step 1: Plan
+    if ! $MOCK; then
+        ai_plan || {
+            log "${YLW}AI planning failed — using keyword fallback${RST}"
+            keyword_fallback
         }
+    else
+        log "mode: mock"
+        keyword_fallback
+    fi
 
-        for role in self.agents:
-            template = templates.get(role, f"You are the {{role}} specialist. Handle the {{role}}-related parts of this task.\n\nTask: {{task}}\n\n{directive}")
-            prompts[role] = template.format(task=self.task, role=role)
+    [[ -z "$PLAN_JSON" ]] && { err "no plan generated"; exit 1; }
 
-        return prompts
+    # Print plan
+    log "${CYN}plan:${RST}"
+    echo "$PLAN_JSON" | jq -r '.phases[] | "  Phase: \(.name) → \([.tasks[] | "\(.role)=\(.agent)"] | join(", "))"'
+    echo ""
 
-    def _print_context_board(self, phase: str) -> None:
-        """Print a live context board showing what the orchestrator knows."""
-        ROLE_COLORS_MAP = {
-            "frontend": CYAN, "backend": GREEN, "review": YELLOW,
-        }
-        width = 62
-        print(f"\n{DIM}{'─' * width}{RESET}")
-        print(f"{BOLD}{MAGENTA}  CONTEXT BOARD  {RESET}{DIM}[{phase}]{RESET}")
-        print(f"{DIM}{'─' * width}{RESET}")
-        print(f"  {BOLD}Task:{RESET} {self.task}")
-        print()
+    # Step 2: Execute phases
+    local num_phases
+    num_phases=$(echo "$PLAN_JSON" | jq '.phases | length')
+    local prev_context=""
 
-        for role, agent_cli in self.agents.items():
-            rc = ROLE_COLORS_MAP.get(role, WHITE)
-            has_result = role in self._results
-            elapsed = self._result_times.get(role)
+    for ((p=0; p<num_phases; p++)); do
+        local phase_json
+        phase_json=$(echo "$PLAN_JSON" | jq ".phases[$p]")
 
-            if has_result:
-                status = f"{GREEN}DONE{RESET}"
-                time_str = f" ({elapsed:.1f}s)" if elapsed else ""
-                model_str = self._result_agents.get(role, agent_cli)
-            else:
-                status = f"{YELLOW}PENDING{RESET}" if phase == "DISPATCH" else f"{YELLOW}RUNNING{RESET}"
-                time_str = ""
-                model_str = agent_cli
+        run_phase "$phase_json" "$((p + 1))" "$num_phases" "$prev_context"
 
-            print(f"  {rc}■{RESET} {BOLD}{role:<12s}{RESET}  model: {BOLD}{model_str:<14s}{RESET}  [{status}]{time_str}")
+        # Collect context for next phase
+        prev_context=$(collect_context)
+    done
 
-            if has_result:
-                snippet = self._results[role][:80].replace("\n", " ")
-                print(f"    {DIM}└─ {snippet}{'...' if len(self._results[role]) > 80 else ''}{RESET}")
+    # Step 3: Report
+    print_report
 
-        print(f"{DIM}{'─' * width}{RESET}\n")
+    # Step 4: AI Synthesis (optional)
+    if ! $MOCK && command -v claude >/dev/null 2>&1; then
+        local all_context
+        all_context=$(collect_context)
+        if [[ -n "$all_context" ]]; then
+            log "${CYN}main agent synthesizing results...${RST}"
+            local synthesis
+            synthesis=$(claude --print -p "You reviewed a multi-agent task.
 
-    def print_summary(self) -> None:
-        """Print final synthesis with requirement traceability."""
-        total_time = max(self._result_times.values()) if self._result_times else 0
-        W = 62
-        ROLE_COLORS_MAP = {
-            "frontend": CYAN, "backend": GREEN, "review": YELLOW,
-        }
-        all_done = len(self._results) == len(self.agents)
-        missing = set(self.agents.keys()) - set(self._results.keys())
-        models_used: dict[str, str] = {}
-        for role in self.agents:
-            models_used[role] = self._result_agents.get(role, self.agents[role])
+TASK: ${TASK}
 
-        # ── 1. Overview ──
-        print(f"\n{BOLD}{'═' * W}{RESET}")
-        print(f"{BOLD}{MAGENTA}  ORCHESTRATION REPORT{RESET}")
-        print(f"{BOLD}{'═' * W}{RESET}\n")
-        print(f"  {BOLD}Task:{RESET}       {self.task}")
-        print(f"  {BOLD}Agents:{RESET}     {len(self._results)}/{len(self.agents)} completed")
-        print(f"  {BOLD}Time:{RESET}       {total_time:.1f}s (parallel)")
-        print(f"  {BOLD}Models:{RESET}     {', '.join(sorted(set(models_used.values())))}")
-        errored_count = sum(1 for v in self._results.values() if v.startswith("[ERROR]"))
-        if all_done and errored_count == 0:
-            status_icon = f"{GREEN}COMPLETE{RESET}"
-        elif errored_count > 0:
-            ok_count = len(self._results) - errored_count
-            status_icon = f"{YELLOW}{ok_count} OK, {errored_count} ERRORED{RESET}"
-        else:
-            status_icon = f"{RED}PARTIAL{RESET}"
-        print(f"  {BOLD}Status:{RESET}     [{status_icon}]")
+RESULTS:
+${all_context}
 
-        # ── 2. Requirement Traceability ──
-        print(f"\n{BOLD}{'─' * W}{RESET}")
-        print(f"{BOLD}  REQUIREMENT TRACEABILITY{RESET}")
-        print(f"{BOLD}{'─' * W}{RESET}")
-        print(f"  {DIM}dispatched prompt → received result?{RESET}\n")
+Provide: 1) Summary of what each agent did 2) Integration issues 3) Gaps 4) Verdict (complete/partial/failed). Be concise." 2>/dev/null) || true
 
-        for role in self.agents:
-            rc = ROLE_COLORS_MAP.get(role, WHITE)
-            agent = models_used[role]
-            prompt = self._dispatched_prompts.get(role, "")
-            has_result = role in self._results
+            if [[ -n "$synthesis" ]]; then
+                printf "\n${BOLD}${MAG}── AI SYNTHESIS ──${RST}\n\n"
+                echo "$synthesis" | while IFS= read -r line; do
+                    printf "  %s\n" "$line"
+                done
+                echo ""
+            fi
+        fi
+    fi
 
-            # Extract the focus line from the prompt
-            focus = ""
-            for line in prompt.split("\n"):
-                if line.strip().startswith("Focus on:"):
-                    focus = line.strip()
-                    break
+    # Cleanup
+    rm -rf "$CAPTURE_DIR"
+    log "${GRN}done${RST}"
+}
 
-            if has_result:
-                elapsed = self._result_times.get(role, 0)
-                result_len = len(self._results[role])
-                is_error = self._results[role].startswith("[ERROR]")
-                icon = f"{RED}✗{RESET}" if is_error else f"{GREEN}✓{RESET}"
-                suffix = f"  {RED}ERROR{RESET}" if is_error else ""
-                print(f"  {icon} {BOLD}{rc}{role}{RESET}  ({agent}, {elapsed:.1f}s, {result_len} chars){suffix}")
-            else:
-                print(f"  {RED}✗{RESET} {BOLD}{rc}{role}{RESET}  ({agent}) — {RED}NO RESPONSE{RESET}")
-
-            if focus:
-                print(f"    {DIM}requirement: {focus}{RESET}")
-            if has_result:
-                snippet = self._results[role][:100].replace("\n", " ")
-                print(f"    {DIM}response:    {snippet}{'...' if result_len > 100 else ''}{RESET}")
-            print()
-
-        # ── 3. Per-Agent Detail ──
-        print(f"{BOLD}{'─' * W}{RESET}")
-        print(f"{BOLD}  AGENT OUTPUTS{RESET}")
-        print(f"{BOLD}{'─' * W}{RESET}\n")
-
-        for role, result in self._results.items():
-            agent = models_used.get(role, "?")
-            elapsed = self._result_times.get(role, 0)
-            rc = ROLE_COLORS_MAP.get(role, WHITE)
-            print(f"  {rc}┌─ {BOLD}{role}{RESET}{rc} │ {agent} │ {elapsed:.1f}s{RESET}")
-            lines = result.split("\n")
-            for line in lines[:15]:
-                print(f"  {rc}│{RESET} {line}")
-            if len(lines) > 15:
-                print(f"  {rc}│{RESET} {DIM}... ({len(lines) - 15} more lines){RESET}")
-            print(f"  {rc}└{'─' * (W - 2)}{RESET}\n")
-
-        if missing:
-            print(f"  {RED}Missing: {', '.join(missing)}{RESET}\n")
-
-        # ── 4. Context Verification ──
-        print(f"{BOLD}{'─' * W}{RESET}")
-        print(f"{BOLD}  CONTEXT VERIFICATION{RESET}")
-        print(f"{BOLD}{'─' * W}{RESET}\n")
-
-        errored = {r for r, v in self._results.items() if v.startswith("[ERROR]")}
-        succeeded = set(self._results.keys()) - errored
-
-        checks = [
-            ("All agents responded", all_done),
-            ("Each agent received a role-specific prompt", len(self._dispatched_prompts) == len(self.agents)),
-            ("Each result maps to its dispatched role", all(r in self._dispatched_prompts for r in self._results)),
-            ("All agents returned valid results", len(errored) == 0),
-        ]
-
-        for label, passed in checks:
-            icon = f"{GREEN}✓{RESET}" if passed else f"{RED}✗{RESET}"
-            print(f"  {icon} {label}")
-
-        if errored:
-            print(f"\n  {BOLD}Errors:{RESET}")
-            for role in errored:
-                agent = models_used.get(role, "?")
-                err_snippet = self._results[role][:80]
-                print(f"    {RED}✗ {role} ({agent}): {err_snippet}{RESET}")
-
-        if all_done and not errored:
-            print(f"\n  {GREEN}{BOLD}All requirements traceable. Context is verified.{RESET}")
-        elif succeeded:
-            print(f"\n  {YELLOW}{BOLD}Partial success — {len(succeeded)}/{len(self.agents)} agents delivered usable results.{RESET}")
-        else:
-            print(f"\n  {RED}{BOLD}All agents failed. No usable context collected.{RESET}")
-
-        # ── 5. AI Synthesis (if available) ──
-        if self._synthesis:
-            print(f"\n{BOLD}{'─' * W}{RESET}")
-            print(f"{BOLD}{MAGENTA}  AI SYNTHESIS  {RESET}{DIM}(main agent: claude){RESET}")
-            print(f"{BOLD}{'─' * W}{RESET}\n")
-            for line in self._synthesis.split("\n"):
-                print(f"  {line}")
-            print()
-
-        print(f"{BOLD}{'═' * W}{RESET}\n")
-
-    def cleanup(self) -> None:
-        """Stop broker and clean up resources."""
-        log("cleaning up...", YELLOW)
-
-        # Stop broker
-        if self.broker_proc and self.broker_proc.poll() is None:
-            self.broker_proc.terminate()
-            try:
-                self.broker_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.broker_proc.kill()
-            log("broker stopped", GREEN)
-
-        # Clean socket
-        sock = Path(SOCKET_PATH)
-        if sock.exists():
-            sock.unlink()
-        pid_file = Path(SOCKET_PATH + ".pid")
-        if pid_file.exists():
-            pid_file.unlink()
-
-        log("cleanup complete", GREEN)
-
-
-# ── Entry point ──────────────────────────────────────────────────────
-
-def parse_agents(agents_str: str) -> dict[str, str]:
-    """Parse 'role=agent,role=agent' into dict."""
-    result = {}
-    for pair in agents_str.split(","):
-        pair = pair.strip()
-        if "=" in pair:
-            role, agent = pair.split("=", 1)
-            result[role.strip()] = agent.strip()
-        else:
-            raise ValueError(
-                f"Invalid agent spec '{pair}'. Expected 'role=agent' "
-                f"(e.g., frontend=claude-code)"
-            )
-    return result
-
-
-async def run(args: argparse.Namespace) -> None:
-    phases: list[dict] | None = None
-
-    if args.mock:
-        agents = DEFAULT_MOCK_AGENTS
-        log("mode: mock", DIM)
-    elif args.agents:
-        agents = parse_agents(args.agents)
-        log("mode: manual assignment", DIM)
-    else:
-        # ── Auto mode: AI planning with keyword fallback ──
-        available = detect_available_agents()
-        plan = ai_plan_task(args.task, available)
-
-        if plan and "phases" in plan:
-            phases = plan["phases"]
-            log("mode: AI-planned (phased)", GREEN)
-
-            # Collect all agents from phases
-            agents = {}
-            W = 62
-            print(f"\n{DIM}{'─' * W}{RESET}")
-            print(f"{BOLD}{CYAN}  AI PLAN  {RESET}{DIM}(main agent: claude){RESET}")
-            print(f"{DIM}{'─' * W}{RESET}")
-
-            for pi, phase in enumerate(phases):
-                pname = phase.get("name", f"phase-{pi+1}")
-                tasks = phase.get("tasks", [])
-                print(f"\n  {BOLD}Phase {pi+1}: {pname}{RESET}  ({len(tasks)} tasks, parallel)")
-                for t in tasks:
-                    role = t.get("role", "?")
-                    agent = t.get("agent", "?")
-                    prompt = t.get("prompt", "")
-                    agents[role] = agent
-                    snippet = prompt[:90].replace("\n", " ")
-                    print(f"    {BOLD}{role}{RESET} → {agent}")
-                    print(f"      {DIM}{snippet}{'...' if len(prompt) > 90 else ''}{RESET}")
-
-            print(f"\n{DIM}{'─' * W}{RESET}\n")
-        else:
-            # Fallback to keyword-based planning with proper phasing
-            log("mode: keyword auto-plan (AI unavailable)", YELLOW)
-            roles = analyze_task_roles(args.task)
-            agents = assign_agents(roles, available)
-            print_auto_plan(args.task, available, roles, agents)
-
-            # Build phased plan: implement tasks first, then review
-            impl_roles = {r: a for r, a in agents.items() if r != "review"}
-            review_roles = {r: a for r, a in agents.items() if r == "review"}
-
-            phases = []
-            if impl_roles:
-                phases.append({
-                    "name": "implement",
-                    "tasks": [{"role": r, "agent": a, "prompt": ""} for r, a in impl_roles.items()],
-                })
-            if review_roles:
-                phases.append({
-                    "name": "review",
-                    "tasks": [{"role": r, "agent": a, "prompt": ""} for r, a in review_roles.items()],
-                })
-
-    session = OrchestrateSession(
-        task=args.task,
-        agents=agents,
-        cwd=args.cwd,
-    )
-    if phases:
-        session._phases = phases
-        # Build ai_prompts from phases
-        for phase in phases:
-            for t in phase.get("tasks", []):
-                session._ai_prompts[t["role"]] = t.get("prompt", "")
-
-    try:
-        # Step 1: Start broker
-        session.start_broker()
-
-        # Step 2+3+4: Phased execution (create panes → launch → dispatch → collect → close per phase)
-        await session.run_phased()
-
-        # AI synthesis of results
-        usable_results = {r: v for r, v in session._results.items() if not v.startswith("[ERROR]")}
-        if usable_results and not args.mock:
-            synthesis = ai_synthesize(args.task, usable_results, agents)
-            if synthesis:
-                session._synthesis = synthesis
-
-        # Print summary
-        session.print_summary()
-
-    except KeyboardInterrupt:
-        log("interrupted", YELLOW)
-    except Exception as e:
-        log(f"error: {e}", RED)
-        raise
-    finally:
-        session.cleanup()
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="cmux orchestrate — Multi-Agent Orchestrator",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Auto mode: detect installed agents, assign roles automatically
-  cmux-orchestrate --task "Build a login page with OAuth"
-
-  # Manual override
-  cmux-orchestrate --task "Build a dashboard" \\
-      --agents frontend=claude-code,backend=codex,review=gemini-cli
-
-  # Mock mode (testing/demo)
-  cmux-orchestrate --task "Build a dashboard" --mock
-        """,
-    )
-    parser.add_argument(
-        "--task", required=True,
-        help="The task to distribute across agents"
-    )
-    parser.add_argument(
-        "--agents", default="",
-        help="Agent assignments: role=agent,... "
-             "(e.g., frontend=claude-code,backend=codex,review=gemini-cli)"
-    )
-    parser.add_argument(
-        "--mock", action="store_true",
-        help="Use mock agents (for testing/demo)"
-    )
-    parser.add_argument(
-        "--cwd", default=None,
-        help="Working directory for agents (default: current directory)"
-    )
-    parser.add_argument(
-        "--socket", default=None,
-        help="Broker socket path (default: /tmp/cmux-orchestrate.sock)"
-    )
-
-    args = parser.parse_args()
-
-    # No error if neither --agents nor --mock: auto mode kicks in
-
-    if args.socket:
-        global SOCKET_PATH
-        SOCKET_PATH = args.socket
-
-    banner()
-    log(f"task: {args.task}", WHITE)
-    if args.mock:
-        log(f"agents: mock (frontend, backend, review)", WHITE)
-    elif args.agents:
-        log(f"agents: {args.agents}", WHITE)
-    else:
-        log(f"agents: auto-detect", CYAN)
-    log(f"cwd: {args.cwd or os.getcwd()}", DIM)
-    print()
-
-    asyncio.run(run(args))
-
-
-if __name__ == "__main__":
-    main()
+main
