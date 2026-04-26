@@ -152,6 +152,9 @@ class OrchestrateSession:
         self.broker_proc: subprocess.Popen | None = None
         self.surface_ids: dict[str, str] = {}  # role -> surface ref
         self._results: dict[str, str] = {}
+        self._result_agents: dict[str, str] = {}  # role -> agent that produced result
+        self._result_times: dict[str, float] = {}  # role -> elapsed seconds
+        self._dispatch_time: float = 0.0
 
     def start_broker(self) -> None:
         """Launch the IPC broker as a background process."""
@@ -269,17 +272,22 @@ class OrchestrateSession:
         except asyncio.TimeoutError:
             log("timeout waiting for agents — proceeding anyway", YELLOW)
 
+        # ── Context Board: show agent assignments ─────────────
+        self._print_context_board("DISPATCH")
+
         # Dispatch tasks to each role
         task_prompts = self._decompose_task()
+        self._dispatch_time = time.time()
 
         for role, prompt in task_prompts.items():
+            agent_cli = self.agents[role]
             msg = {
                 "type": "task",
                 "from": "orchestrator",
                 "to": role,
                 "payload": prompt,
             }
-            log(f"dispatching task → {role}", CYAN)
+            log(f"dispatching → {BOLD}{role}{RESET} via {BOLD}{agent_cli}{RESET}", CYAN)
             writer.write((json.dumps(msg) + "\n").encode())
             await writer.drain()
 
@@ -296,13 +304,26 @@ class OrchestrateSession:
 
                 if msg.get("type") == "result":
                     from_role = msg.get("from", "?")
+                    from_agent = msg.get("agent", self.agents.get(from_role, "?"))
                     payload = msg.get("payload", "")
+                    elapsed = time.time() - self._dispatch_time
+
                     self._results[from_role] = payload
+                    self._result_agents[from_role] = from_agent
+                    self._result_times[from_role] = elapsed
                     pending.discard(from_role)
-                    log(f"result received from {from_role} ({len(pending)} remaining)", GREEN)
-                    # Print result snippet
-                    snippet = payload[:150].replace("\n", " ")
-                    log(f"  └─ {snippet}{'...' if len(payload) > 150 else ''}", DIM)
+
+                    log(
+                        f"result from {BOLD}{from_role}{RESET} "
+                        f"({BOLD}{from_agent}{RESET}, {elapsed:.1f}s) "
+                        f"— {len(pending)} remaining",
+                        GREEN,
+                    )
+                    snippet = payload[:120].replace("\n", " ")
+                    log(f"  └─ {snippet}{'...' if len(payload) > 120 else ''}", DIM)
+
+                    # Live context board update
+                    self._print_context_board("PROGRESS")
         except asyncio.TimeoutError:
             log(f"timeout — missing results from: {', '.join(pending)}", RED)
 
@@ -352,22 +373,60 @@ class OrchestrateSession:
 
         return prompts
 
+    def _print_context_board(self, phase: str) -> None:
+        """Print a live context board showing what the orchestrator knows."""
+        ROLE_COLORS_MAP = {
+            "frontend": CYAN, "backend": GREEN, "review": YELLOW,
+        }
+        width = 62
+        print(f"\n{DIM}{'─' * width}{RESET}")
+        print(f"{BOLD}{MAGENTA}  CONTEXT BOARD  {RESET}{DIM}[{phase}]{RESET}")
+        print(f"{DIM}{'─' * width}{RESET}")
+        print(f"  {BOLD}Task:{RESET} {self.task}")
+        print()
+
+        for role, agent_cli in self.agents.items():
+            rc = ROLE_COLORS_MAP.get(role, WHITE)
+            has_result = role in self._results
+            elapsed = self._result_times.get(role)
+
+            if has_result:
+                status = f"{GREEN}DONE{RESET}"
+                time_str = f" ({elapsed:.1f}s)" if elapsed else ""
+                model_str = self._result_agents.get(role, agent_cli)
+            else:
+                status = f"{YELLOW}PENDING{RESET}" if phase == "DISPATCH" else f"{YELLOW}RUNNING{RESET}"
+                time_str = ""
+                model_str = agent_cli
+
+            print(f"  {rc}■{RESET} {BOLD}{role:<12s}{RESET}  model: {BOLD}{model_str:<14s}{RESET}  [{status}]{time_str}")
+
+            if has_result:
+                snippet = self._results[role][:80].replace("\n", " ")
+                print(f"    {DIM}└─ {snippet}{'...' if len(self._results[role]) > 80 else ''}{RESET}")
+
+        print(f"{DIM}{'─' * width}{RESET}\n")
+
     def print_summary(self) -> None:
-        """Print final results summary."""
-        print(f"\n{'=' * 60}")
-        print(f"{BOLD}{GREEN}  ORCHESTRATION COMPLETE{RESET}")
-        print(f"{'=' * 60}")
-        print(f"\n{BOLD}Task:{RESET} {self.task}\n")
+        """Print final synthesis: individual results + aggregated context."""
+        total_time = max(self._result_times.values()) if self._result_times else 0
+        ROLE_COLORS_MAP = {
+            "frontend": CYAN, "backend": GREEN, "review": YELLOW,
+        }
+
+        # ── Final context board ──
+        self._print_context_board("COMPLETE")
+
+        # ── Per-agent results ──
+        print(f"{BOLD}{'=' * 62}{RESET}")
+        print(f"{BOLD}{GREEN}  RESULTS BY AGENT{RESET}")
+        print(f"{BOLD}{'=' * 62}{RESET}\n")
 
         for role, result in self._results.items():
-            agent = self.agents.get(role, "unknown")
-            rc = {
-                "frontend": CYAN,
-                "backend": GREEN,
-                "review": YELLOW,
-            }.get(role, WHITE)
-            print(f"{BOLD}{rc}── {role} ({agent}) ──{RESET}")
-            # Indent result
+            agent = self._result_agents.get(role, self.agents.get(role, "?"))
+            elapsed = self._result_times.get(role, 0)
+            rc = ROLE_COLORS_MAP.get(role, WHITE)
+            print(f"{BOLD}{rc}── {role} ──{RESET}  model: {BOLD}{agent}{RESET}  time: {elapsed:.1f}s")
             for line in result.split("\n")[:20]:
                 print(f"  {line}")
             if result.count("\n") > 20:
@@ -378,7 +437,53 @@ class OrchestrateSession:
         if missing:
             print(f"{RED}Missing results from: {', '.join(missing)}{RESET}\n")
 
-        print(f"{'=' * 60}\n")
+        # ── Synthesized context ──
+        print(f"{BOLD}{'=' * 62}{RESET}")
+        print(f"{BOLD}{MAGENTA}  SYNTHESIZED CONTEXT{RESET}")
+        print(f"{BOLD}{'=' * 62}{RESET}\n")
+
+        print(f"  {BOLD}Task:{RESET}     {self.task}")
+        print(f"  {BOLD}Agents:{RESET}   {len(self._results)}/{len(self.agents)} completed")
+        print(f"  {BOLD}Time:{RESET}     {total_time:.1f}s (wall clock, parallel)")
+        print()
+
+        # Show which model handled what
+        print(f"  {BOLD}Model Coverage:{RESET}")
+        models_used = set()
+        for role in self.agents:
+            agent = self._result_agents.get(role, self.agents[role])
+            models_used.add(agent)
+            status = f"{GREEN}OK{RESET}" if role in self._results else f"{RED}FAIL{RESET}"
+            print(f"    {role:<12s} → {BOLD}{agent}{RESET}  [{status}]")
+        print(f"\n  {BOLD}Unique models:{RESET} {', '.join(sorted(models_used))}")
+
+        # Context completeness check
+        print(f"\n  {BOLD}Context Completeness:{RESET}")
+        all_done = len(self._results) == len(self.agents)
+        if all_done:
+            print(f"    {GREEN}All agents reported. Context is complete.{RESET}")
+        else:
+            print(f"    {RED}Incomplete — {len(self.agents) - len(self._results)} agent(s) did not report.{RESET}")
+            print(f"    {YELLOW}Synthesized output may be partial.{RESET}")
+
+        # Aggregated output
+        if self._results:
+            print(f"\n  {BOLD}Aggregated Output:{RESET}")
+            print(f"  {DIM}(all agent outputs concatenated for downstream consumption){RESET}\n")
+            print(f"  {DIM}{'─' * 58}{RESET}")
+            for role in self.agents:
+                if role in self._results:
+                    agent = self._result_agents.get(role, self.agents[role])
+                    print(f"  {BOLD}[{role} | {agent}]{RESET}")
+                    for line in self._results[role].split("\n")[:15]:
+                        print(f"  {line}")
+                    if self._results[role].count("\n") > 15:
+                        remaining = self._results[role].count("\n") - 15
+                        print(f"  {DIM}... ({remaining} more lines){RESET}")
+                    print()
+            print(f"  {DIM}{'─' * 58}{RESET}")
+
+        print(f"\n{BOLD}{'=' * 62}{RESET}\n")
 
     def cleanup(self) -> None:
         """Stop broker and clean up resources."""

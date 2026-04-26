@@ -54,11 +54,15 @@ SOCKET_PATH = os.environ.get(
 )
 
 
+_CURRENT_AGENT: str = ""
+
+
 def log(role: str, msg: str, color: str = "") -> None:
     ts = time.strftime("%H:%M:%S")
     rc = ROLE_COLORS.get(role, WHITE)
     c = color or rc
-    print(f"{DIM}{ts}{RESET} {BOLD}{rc}[{role}]{RESET} {c}{msg}{RESET}", flush=True)
+    agent_tag = f" {DIM}({_CURRENT_AGENT}){RESET}" if _CURRENT_AGENT else ""
+    print(f"{DIM}{ts}{RESET} {BOLD}{rc}[{role}]{RESET}{agent_tag} {c}{msg}{RESET}", flush=True)
 
 
 def banner(role: str, agent: str) -> None:
@@ -208,11 +212,12 @@ class WorkerClient:
                 else:
                     result = await run_agent_cli(self.role, self.agent, payload)
 
-                # Send result back
+                # Send result back (include agent/model info)
                 await self.send({
                     "type": "result",
                     "from": self.role,
                     "to": sender,
+                    "agent": self.agent,
                     "payload": result,
                 })
                 log(self.role, f"result sent → {sender}", GREEN)
@@ -252,6 +257,9 @@ async def main() -> None:
     if args.socket:
         global SOCKET_PATH
         SOCKET_PATH = args.socket
+
+    global _CURRENT_AGENT
+    _CURRENT_AGENT = args.agent
 
     banner(args.role, args.agent)
 
