@@ -618,7 +618,14 @@ class OrchestrateSession:
         print(f"  {BOLD}Agents:{RESET}     {len(self._results)}/{len(self.agents)} completed")
         print(f"  {BOLD}Time:{RESET}       {total_time:.1f}s (parallel)")
         print(f"  {BOLD}Models:{RESET}     {', '.join(sorted(set(models_used.values())))}")
-        status_icon = f"{GREEN}COMPLETE{RESET}" if all_done else f"{RED}PARTIAL{RESET}"
+        errored_count = sum(1 for v in self._results.values() if v.startswith("[ERROR]"))
+        if all_done and errored_count == 0:
+            status_icon = f"{GREEN}COMPLETE{RESET}"
+        elif errored_count > 0:
+            ok_count = len(self._results) - errored_count
+            status_icon = f"{YELLOW}{ok_count} OK, {errored_count} ERRORED{RESET}"
+        else:
+            status_icon = f"{RED}PARTIAL{RESET}"
         print(f"  {BOLD}Status:{RESET}     [{status_icon}]")
 
         # ── 2. Requirement Traceability ──
@@ -643,7 +650,10 @@ class OrchestrateSession:
             if has_result:
                 elapsed = self._result_times.get(role, 0)
                 result_len = len(self._results[role])
-                print(f"  {GREEN}✓{RESET} {BOLD}{rc}{role}{RESET}  ({agent}, {elapsed:.1f}s, {result_len} chars)")
+                is_error = self._results[role].startswith("[ERROR]")
+                icon = f"{RED}✗{RESET}" if is_error else f"{GREEN}✓{RESET}"
+                suffix = f"  {RED}ERROR{RESET}" if is_error else ""
+                print(f"  {icon} {BOLD}{rc}{role}{RESET}  ({agent}, {elapsed:.1f}s, {result_len} chars){suffix}")
             else:
                 print(f"  {RED}✗{RESET} {BOLD}{rc}{role}{RESET}  ({agent}) — {RED}NO RESPONSE{RESET}")
 
@@ -679,21 +689,33 @@ class OrchestrateSession:
         print(f"{BOLD}  CONTEXT VERIFICATION{RESET}")
         print(f"{BOLD}{'─' * W}{RESET}\n")
 
+        errored = {r for r, v in self._results.items() if v.startswith("[ERROR]")}
+        succeeded = set(self._results.keys()) - errored
+
         checks = [
             ("All agents responded", all_done),
             ("Each agent received a role-specific prompt", len(self._dispatched_prompts) == len(self.agents)),
             ("Each result maps to its dispatched role", all(r in self._dispatched_prompts for r in self._results)),
-            ("No duplicate model assignments", len(set(models_used.values())) == len(models_used) or True),
+            ("All agents returned valid results", len(errored) == 0),
         ]
 
         for label, passed in checks:
             icon = f"{GREEN}✓{RESET}" if passed else f"{RED}✗{RESET}"
             print(f"  {icon} {label}")
 
-        if all_done:
+        if errored:
+            print(f"\n  {BOLD}Errors:{RESET}")
+            for role in errored:
+                agent = models_used.get(role, "?")
+                err_snippet = self._results[role][:80]
+                print(f"    {RED}✗ {role} ({agent}): {err_snippet}{RESET}")
+
+        if all_done and not errored:
             print(f"\n  {GREEN}{BOLD}All requirements traceable. Context is verified.{RESET}")
+        elif succeeded:
+            print(f"\n  {YELLOW}{BOLD}Partial success — {len(succeeded)}/{len(self.agents)} agents delivered usable results.{RESET}")
         else:
-            print(f"\n  {YELLOW}{BOLD}Partial context — {len(missing)} agent(s) missing.{RESET}")
+            print(f"\n  {RED}{BOLD}All agents failed. No usable context collected.{RESET}")
 
         print(f"\n{BOLD}{'═' * W}{RESET}\n")
 

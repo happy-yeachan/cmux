@@ -17,6 +17,8 @@ import argparse
 import asyncio
 import json
 import os
+import pty
+import select
 import signal
 import subprocess
 import sys
@@ -100,12 +102,75 @@ async def run_agent_mock(role: str, task_payload: str) -> str:
     return result
 
 
+def _run_with_pty(cmd: list[str], cwd: str, timeout: float = 300) -> tuple[int, str]:
+    """Run a command with a pseudo-TTY (solves 'stdout is not a terminal')."""
+    master, slave = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=slave,
+            stderr=slave,
+            stdin=subprocess.DEVNULL,
+            cwd=cwd,
+        )
+    except FileNotFoundError:
+        os.close(master)
+        os.close(slave)
+        raise
+    os.close(slave)
+
+    output_chunks: list[bytes] = []
+    deadline = time.time() + timeout
+
+    while proc.poll() is None:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            proc.kill()
+            proc.wait()
+            os.close(master)
+            raise TimeoutError(f"Process timed out after {timeout}s")
+        r, _, _ = select.select([master], [], [], min(remaining, 0.5))
+        if r:
+            try:
+                output_chunks.append(os.read(master, 8192))
+            except OSError:
+                break
+
+    # Drain remaining output
+    while True:
+        r, _, _ = select.select([master], [], [], 0.1)
+        if not r:
+            break
+        try:
+            data = os.read(master, 8192)
+            if not data:
+                break
+            output_chunks.append(data)
+        except OSError:
+            break
+
+    os.close(master)
+    text = b"".join(output_chunks).decode(errors="replace").strip()
+    # Strip ANSI escape sequences for cleaner output
+    import re
+    text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
+    text = re.sub(r"\x1b\].*?\x07", "", text)
+    return proc.returncode, text
+
+
+AGENT_TIMEOUT = int(os.environ.get("CMUX_ORCHESTRATE_TIMEOUT", "600"))
+
+
 async def run_agent_cli(role: str, agent: str, task_payload: str) -> str:
-    """Run a real agent CLI in headless mode and capture output."""
+    """Run a real agent CLI in headless mode and capture output.
+
+    All agents are executed via pseudo-TTY to satisfy isatty() checks
+    (required by codex, beneficial for others).
+    """
     # Build the CLI command based on agent type.
     # Each agent has a different flag for non-interactive/headless execution:
-    #   claude-code:  claude --print --output-format text "<prompt>"
-    #   codex:        codex "<prompt>"                (positional arg)
+    #   claude-code:  claude --print --output-format text -p "<prompt>"
+    #   codex:        codex "<prompt>"                (positional arg, needs TTY)
     #   gemini-cli:   gemini -p "<prompt>"            (-p = non-interactive)
     if agent == "claude-code":
         cmd = ["claude", "--print", "--output-format", "text", "-p", task_payload]
@@ -116,31 +181,28 @@ async def run_agent_cli(role: str, agent: str, task_payload: str) -> str:
     else:
         return await run_agent_mock(role, task_payload)
 
-    log(role, f"executing: {cmd[0]} {' '.join(cmd[1:3])}...", YELLOW)
+    timeout = AGENT_TIMEOUT
+    log(role, f"executing: {cmd[0]} {' '.join(cmd[1:3])}... (timeout: {timeout}s)", YELLOW)
+    cwd = os.environ.get("CMUX_ORCHESTRATE_CWD", os.getcwd())
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=os.environ.get("CMUX_ORCHESTRATE_CWD", os.getcwd()),
+        returncode, output = await asyncio.wait_for(
+            asyncio.to_thread(_run_with_pty, cmd, cwd, timeout),
+            timeout=timeout + 10,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-        output = stdout.decode().strip()
 
-        if proc.returncode != 0:
-            err = stderr.decode().strip()
-            log(role, f"agent exited with code {proc.returncode}", RED)
-            if err:
-                log(role, f"stderr: {err[:200]}", RED)
-            return f"[ERROR] {agent} failed (exit {proc.returncode}): {err[:200]}"
+        if returncode != 0:
+            log(role, f"agent exited with code {returncode}", RED)
+            if output:
+                log(role, f"output: {output[:200]}", RED)
+            return f"[ERROR] {agent} failed (exit {returncode}): {output[:300]}"
 
         log(role, f"agent completed ({len(output)} chars)", GREEN)
         return output
 
-    except asyncio.TimeoutError:
-        log(role, "agent timed out (300s)", RED)
-        return f"[ERROR] {agent} timed out after 300s"
+    except (TimeoutError, asyncio.TimeoutError):
+        log(role, f"agent timed out ({timeout}s)", RED)
+        return f"[ERROR] {agent} timed out after {timeout}s"
     except FileNotFoundError:
         log(role, f"'{cmd[0]}' not found — falling back to mock", RED)
         return await run_agent_mock(role, task_payload)
